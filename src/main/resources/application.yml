@@ -1,0 +1,69 @@
+spring:
+  application:
+    name: agentic-url-shortener
+  threads:
+    virtual:
+      enabled: true
+  datasource:
+    # File-based so workflow runs (event-sourced) survive restarts. Swap for Postgres via env vars.
+    url: ${DB_URL:jdbc:h2:file:./data/shortener}
+    username: ${DB_USER:sa}
+    password: ${DB_PASSWORD:}
+  jpa:
+    open-in-view: false
+    hibernate:
+      # Flyway owns the schema; Hibernate only verifies the mapping matches it.
+      ddl-auto: validate
+  flyway:
+    locations: classpath:db/migration
+  h2:
+    console:
+      enabled: false
+  mvc:
+    problemdetails:
+      enabled: true
+
+server:
+  error:
+    include-stacktrace: never
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+springdoc:
+  # Enabled for the prototype; a production profile would disable both or put them behind auth.
+  api-docs:
+    enabled: true
+  swagger-ui:
+    enabled: true
+
+logging:
+  pattern:
+    # Every log line carries the HTTP request id and, inside workflow execution, the run id.
+    correlation: "[req=%X{requestId:-} run=%X{runId:-}] "
+
+app:
+  security:
+    # Demo users. Passwords are bcrypt hashes; plaintext demo values are documented in the README.
+    # In production these come from an identity provider (OIDC), not from config.
+    users:
+      - username: alice
+        password: "{bcrypt}$2a$10$VGNMDqji0tIm2BYMwK6Uz.vgbN1b0uTB/Qe/Q/7sq/ymqCkEY9vPi"
+        roles: [REQUESTER]
+      - username: bob
+        password: "{bcrypt}$2a$10$Vz7p3fpknipQXkJI0TTCTexvswUmTDJdwO3IGb9gW8dXfOw7wkdmW"
+        roles: [APPROVER]
+      - username: carol
+        password: "{bcrypt}$2a$10$29bMTXgCgXRFsHPmGZTeWONBTKDRW97g5/u/3gbDdxB1ecyhNQNvi"
+        roles: [APPROVER]
+      - username: admin
+        password: "{bcrypt}$2a$10$YlBzeRkPKgPSWhT86wILqez8qMW4zBji1ccyWPfWgXrze1EEjgaZq"
+        roles: [ADMIN]
