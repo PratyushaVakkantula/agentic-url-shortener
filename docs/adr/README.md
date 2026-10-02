@@ -8,3 +8,5 @@ decision gets a new ADR that supersedes the old one.
 | # | Title | Status |
 |---|-------|--------|
 | [0001](0001-modular-monolith.md) | Modular monolith with enforced module boundaries | Accepted |
+| [0002](0002-random-short-codes.md) | Random short codes with database-enforced uniqueness | Accepted |
+| [0003](0003-url-safety-without-dns.md) | URL safety validation is syntactic; no DNS resolution | Accepted |

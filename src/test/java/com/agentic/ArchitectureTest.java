@@ -33,6 +33,18 @@ class ArchitectureTest {
             .that().resideInAPackage("com.agentic.platform..")
             .should().dependOnClassesThat().resideInAnyPackage("com.agentic.shortener..", "com.agentic.orchestration..");
 
+    /** The shortener is a standalone business module; it knows nothing of the orchestrator. */
+    @ArchTest
+    static final ArchRule shortenerDoesNotDependOnOrchestration = noClasses()
+            .that().resideInAPackage("com.agentic.shortener..")
+            .should().dependOnClassesThat().resideInAPackage("com.agentic.orchestration..");
+
+    /** Only the service layer talks to repositories; keeps transactions and rules in one place. */
+    @ArchTest
+    static final ArchRule repositoriesAreOnlyUsedByServices = noClasses()
+            .that().resideOutsideOfPackages("..service..", "..repository..")
+            .should().dependOnClassesThat().resideInAPackage("..repository..");
+
     /** Time must come from the injected Clock so expiry/timeouts/metrics are testable. */
     @ArchTest
     static final ArchRule timeComesFromInjectedClock = noClasses()
