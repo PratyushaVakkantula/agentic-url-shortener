@@ -88,7 +88,7 @@ final class RunCoordinator {
     private static final String SYSTEM = "system";
 
     sealed interface Signal permits Schedule, StageOutcome, AttemptTimedOut, RetryDue, ApprovalCommand,
-            ApprovalExpired, StopCommand, CompensationFinished {
+            ApprovalExpired, StopCommand, CompensationFinished, ReviseCommand {
     }
 
     record Schedule() implements Signal {
@@ -111,6 +111,10 @@ final class RunCoordinator {
     }
 
     record CompensationFinished(String stageId, boolean succeeded, String detail) implements Signal {
+    }
+
+    record ReviseCommand(String stageId, JsonNode content, String actor, String reason,
+                         CompletableFuture<Artifact> reply) implements Signal {
     }
 
     private final String runId;
@@ -233,6 +237,7 @@ final class RunCoordinator {
             case ApprovalExpired x -> onApprovalExpired(x.approvalId());
             case StopCommand s -> onStop(s);
             case CompensationFinished f -> onCompensationFinished(f);
+            case ReviseCommand r -> onRevise(r);
         }
     }
 
@@ -249,9 +254,19 @@ final class RunCoordinator {
 
         Artifact previous = state.latestArtifact(id);
         Artifact artifact = new Artifact(id, previous == null ? 1 : previous.version() + 1,
-                hasher.hash(outcome.output()), outcome.output(), now());
+                hasher.hash(outcome.output()), outcome.output(), now(), outcome.inputs());
         emit(seq -> new RunEvent.ArtifactProduced(runId, seq, now(), artifact));
         outcome.decisions().forEach(d -> emit(seq -> new RunEvent.DecisionRecorded(runId, seq, now(), d)));
+
+        // An input was revised while this attempt ran: its output is already outdated. Not a
+        // failure (the agent did nothing wrong), so re-run as a new generation instead of retrying.
+        List<ArtifactRef> staleInputs = staleInputs(artifact);
+        if (!staleInputs.isEmpty()) {
+            emit(seq -> new RunEvent.StageInvalidated(runId, seq, now(), id, staleInputs,
+                    "inputs changed while the stage was running: " + staleInputs));
+            schedule();
+            return;
+        }
         outcome.exitGates().forEach(g -> emit(seq -> new RunEvent.GateEvaluated(runId, seq, now(), id, GateKind.EXIT,
                 g.gate(), g.passed(), g.reason())));
         outcome.policies().forEach(p -> emit(seq -> new RunEvent.PolicyEvaluated(runId, seq, now(), id,
@@ -313,7 +328,8 @@ final class RunCoordinator {
         boolean onFallback = state.fallbackActive(id);
         boolean mayContinue = !state.stopRequested() && !state.anyStage(StageStatus.FAILED);
 
-        if (mayContinue && kind.retryable() && !onFallback && attempt < retry.maxAttempts()) {
+        int attemptInGeneration = state.attemptsInGeneration(id, attempt);
+        if (mayContinue && kind.retryable() && !onFallback && attemptInGeneration < retry.maxAttempts()) {
             Duration delay = retry.backoffAfter(attempt);
             emit(seq -> new RunEvent.AttemptFailed(runId, seq, now(), id, attempt, kind, reason));
             emit(seq -> new RunEvent.RetryScheduled(runId, seq, now(), id, attempt + 1, delay.toMillis()));
@@ -321,7 +337,7 @@ final class RunCoordinator {
         } else if (mayContinue && fallback != null && !onFallback && kind != FailureKind.ENTRY_GATE) {
             emit(seq -> new RunEvent.AttemptFailed(runId, seq, now(), id, attempt, kind, reason));
             emit(seq -> new RunEvent.FallbackActivated(runId, seq, now(), id, fallback.name(),
-                    "primary agent failed after " + attempt + " attempt(s): " + reason));
+                    "primary agent failed after " + attemptInGeneration + " attempt(s): " + reason));
             dispatch(stage);
         } else {
             emit(seq -> new RunEvent.StageFailed(runId, seq, now(), id, attempt, kind, reason));
@@ -402,6 +418,89 @@ final class RunCoordinator {
         schedule();
     }
 
+    // ---- re-planning (OR-12) ----
+
+    /**
+     * Sends back to PENDING every accepted (or awaiting-approval) stage whose output was derived
+     * from an input version that is no longer current. Walks in topological order but only checks
+     * <i>direct</i> provenance: a stage further downstream is re-evaluated only once its own input
+     * actually re-runs and changes. If that re-run reproduces identical content, the hashes match
+     * and the cascade stops there (early cutoff).
+     */
+    private void invalidateStaleStages() {
+        for (String id : definition.topologicalOrder()) {
+            StageStatus status = state.stageStatus(id);
+            if (status != StageStatus.SUCCEEDED && status != StageStatus.AWAITING_APPROVAL) {
+                continue;
+            }
+            Artifact artifact = state.latestArtifact(id);
+            List<ArtifactRef> stale = artifact == null ? List.of() : staleInputs(artifact);
+            if (stale.isEmpty()) {
+                continue;
+            }
+            if (status == StageStatus.AWAITING_APPROVAL) {
+                state.pendingApprovals().stream().filter(a -> a.stageId().equals(id)).forEach(a -> {
+                    cancelTimer("approval:" + a.approvalId());
+                    emit(seq -> new RunEvent.ApprovalDecided(runId, seq, now(), a.approvalId(), id,
+                            ApprovalStatus.WITHDRAWN, SYSTEM, "superseded: the artifact under review is outdated"));
+                });
+            }
+            String changes = String.join(", ", stale.stream().map(ref -> ref.stageId() + " v" + ref.version()
+                    + " -> v" + state.latestArtifact(ref.stageId()).version()).toList());
+            emit(seq -> new RunEvent.StageInvalidated(runId, seq, now(), id, stale, "input changed: " + changes));
+        }
+    }
+
+    /** Inputs whose current content differs from the version this artifact was derived from. */
+    private List<ArtifactRef> staleInputs(Artifact artifact) {
+        return artifact.derivedFrom().stream().filter(ref -> {
+            Artifact current = state.latestArtifact(ref.stageId());
+            return current != null && !current.contentHash().equals(ref.contentHash());
+        }).toList();
+    }
+
+    /**
+     * A human replaces a stage's output. The revision passes the same policies as agent output
+     * (a person can paste a secret too), needs approval under the same rules, and then re-planning
+     * invalidates whatever consumed the old version.
+     */
+    private void onRevise(ReviseCommand cmd) {
+        String id = cmd.stageId();
+        if (!definition.hasStage(id) || state.stageStatus(id) != StageStatus.SUCCEEDED || windingDown()) {
+            cmd.reply().completeExceptionally(new GovernanceException(Violation.STAGE_NOT_REVISABLE,
+                    "Stage '" + id + "' cannot be revised now (only SUCCEEDED stages of an active run)"));
+            return;
+        }
+        List<PolicyDecision> verdicts = policies.evaluate(new PolicyInput(definition.name(), id, state.requirement(),
+                cmd.content(), mapper.writeValueAsString(cmd.content())));
+        if (PolicyEngine.mostSevere(verdicts) == PolicyOutcome.BLOCK) {
+            cmd.reply().completeExceptionally(new GovernanceException(Violation.REVISION_BLOCKED_BY_POLICY,
+                    summarize(verdicts, PolicyOutcome.BLOCK)));
+            return;
+        }
+
+        Artifact previous = state.latestArtifact(id);
+        Artifact revised = new Artifact(id, previous == null ? 1 : previous.version() + 1, hasher.hash(cmd.content()),
+                cmd.content(), now(), List.of());
+        emit(seq -> new RunEvent.ArtifactRevised(runId, seq, now(), revised, cmd.actor(), cmd.reason()));
+        int attempt = state.attempts(id);
+        verdicts.forEach(p -> emit(seq -> new RunEvent.PolicyEvaluated(runId, seq, now(), id, attempt,
+                p.policy(), p.category(), p.outcome(), p.reason())));
+
+        List<String> approvalReasons = new ArrayList<>();
+        StageDefinition stage = definition.stage(id);
+        if (stage.policy().requiresApproval()) {
+            approvalReasons.add("high-impact stage: " + stage.policy().approvalReason());
+        }
+        verdicts.stream().filter(p -> p.outcome() == PolicyOutcome.REQUIRE_APPROVAL)
+                .forEach(p -> approvalReasons.add(p.category() + "/" + p.policy() + ": " + p.reason()));
+        if (!approvalReasons.isEmpty()) {
+            requestApproval(id, attempt, revised.ref(), approvalReasons);
+        }
+        cmd.reply().complete(revised);
+        schedule();
+    }
+
     // ---- safe-stop (OR-8) ----
 
     private void onStop(StopCommand cmd) {
@@ -426,6 +525,9 @@ final class RunCoordinator {
         if (state.rollbackPlan().isPresent()) {
             continueRollback();
             return;
+        }
+        if (!windingDown()) {
+            invalidateStaleStages();
         }
         for (String id : definition.topologicalOrder()) {
             if (state.stageStatus(id) != StageStatus.PENDING) {
@@ -600,7 +702,7 @@ final class RunCoordinator {
             }).toList();
             List<PolicyDecision> verdicts = policies.evaluate(new PolicyInput(definition.name(), id,
                     context.requirement(), output, mapper.writeValueAsString(output)));
-            return new Completed(id, attempt, output, decisions, gates, verdicts, elapsedMillis(started));
+            return new Completed(id, attempt, output, read, decisions, gates, verdicts, elapsedMillis(started));
         } catch (ContextAccessException e) {
             return new Errored(id, attempt, FailureKind.CONTEXT_VIOLATION, e.getMessage(), elapsedMillis(started));
         } catch (Exception e) {
@@ -649,6 +751,8 @@ final class RunCoordinator {
                 a.reply().completeExceptionally(notActive);
             } else if (signal instanceof StopCommand s) {
                 s.reply().completeExceptionally(notActive);
+            } else if (signal instanceof ReviseCommand r) {
+                r.reply().completeExceptionally(notActive);
             }
         }
     }

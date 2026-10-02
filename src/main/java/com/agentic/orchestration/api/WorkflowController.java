@@ -4,7 +4,10 @@ import com.agentic.orchestration.engine.WorkflowCatalog;
 import com.agentic.orchestration.engine.WorkflowEngine;
 import com.agentic.orchestration.engine.UnknownWorkflowException;
 import com.agentic.orchestration.event.RunSummary;
+import com.agentic.orchestration.metrics.ReliabilityMetrics;
+import com.agentic.orchestration.metrics.ReliabilityReport;
 import com.agentic.orchestration.model.Approval;
+import com.agentic.orchestration.model.Artifact;
 import com.agentic.orchestration.model.Requirement;
 import com.agentic.orchestration.state.RunView;
 import io.swagger.v3.oas.annotations.Operation;
@@ -90,6 +93,29 @@ public class WorkflowController {
     public ResponseEntity<Void> stop(@PathVariable String runId, @Valid @RequestBody StopRunRequest request, Principal principal) {
         engine.requestStop(runId, principal.getName(), request.reason());
         return ResponseEntity.accepted().build();
+    }
+
+    @PostMapping("/runs/{runId}/stages/{stageId}/revisions")
+    @PreAuthorize("hasRole('REQUESTER')")
+    @Operation(summary = "Revise a stage's output (REQUESTER)",
+            description = "Replaces a SUCCEEDED stage's artifact. Same policies as agent output; downstream stages "
+                    + "that consumed the old version are re-planned. 409 if not revisable, 422 if a policy blocks it.")
+    public Artifact revise(@PathVariable String runId, @PathVariable String stageId,
+                           @Valid @RequestBody RevisionRequest request, Principal principal) {
+        return engine.revise(runId, stageId, request.content(), principal.getName(), request.reason());
+    }
+
+    @GetMapping("/runs/{runId}/metrics")
+    @Operation(summary = "Reliability metrics of one run")
+    public ReliabilityReport runMetrics(@PathVariable String runId) {
+        return ReliabilityMetrics.compute(List.of(engine.events(runId)));
+    }
+
+    @GetMapping("/metrics")
+    @Operation(summary = "Reliability metrics across all runs",
+            description = "Success rate, retry/rollback frequency, MTTR, end-to-end latency, governance and re-planning.")
+    public ReliabilityReport metrics() {
+        return ReliabilityMetrics.compute(engine.allRunEvents());
     }
 
     @GetMapping("/runs/{runId}/events")

@@ -40,7 +40,7 @@ public record RunView(
     }
 
     public record StageView(String id, StageStatus status, String agent, int attempts, boolean fallbackActive,
-                            int artifactVersion, FailureKind lastFailureKind, String lastFailure,
+                            int invalidations, int artifactVersion, FailureKind lastFailureKind, String lastFailure,
                             Instant startedAt, Instant finishedAt, List<RunState.GateRecord> gates,
                             List<RunState.PolicyRecord> policies, String compensation) {
     }

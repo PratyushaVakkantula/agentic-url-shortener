@@ -82,6 +82,22 @@ public sealed interface RunEvent {
                             String detail) implements RunEvent {
     }
 
+    /**
+     * A human replaced a stage's output (e.g. corrected the requirements agent's assumptions).
+     * Triggers re-planning: consumers of the old version become stale.
+     */
+    record ArtifactRevised(String runId, long seq, Instant at, Artifact artifact, String actor,
+                           String reason) implements RunEvent {
+    }
+
+    /**
+     * Re-planning (OR-12): the stage's output was derived from inputs that have since changed, so
+     * it goes back to PENDING and runs again as a fresh generation (new retry budget).
+     */
+    record StageInvalidated(String runId, long seq, Instant at, String stageId, List<ArtifactRef> staleInputs,
+                            String reason) implements RunEvent {
+    }
+
     record StageSucceeded(String runId, long seq, Instant at, String stageId, int attempt,
                           long durationMillis) implements RunEvent {
     }

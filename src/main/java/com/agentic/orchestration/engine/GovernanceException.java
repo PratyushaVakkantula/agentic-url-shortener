@@ -11,7 +11,11 @@ public class GovernanceException extends RuntimeException {
         APPROVAL_NOT_FOUND,
         APPROVAL_NOT_PENDING,
         /** The run has finished; it no longer accepts commands. */
-        RUN_NOT_ACTIVE
+        RUN_NOT_ACTIVE,
+        /** Only a SUCCEEDED stage's output can be revised. */
+        STAGE_NOT_REVISABLE,
+        /** A guardrail blocked the revised content (same policies as agent output). */
+        REVISION_BLOCKED_BY_POLICY
     }
 
     private final Violation violation;

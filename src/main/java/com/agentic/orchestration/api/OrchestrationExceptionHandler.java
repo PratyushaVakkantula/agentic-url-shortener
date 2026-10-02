@@ -32,7 +32,8 @@ public class OrchestrationExceptionHandler {
         HttpStatus status = switch (ex.violation()) {
             case SELF_APPROVAL_FORBIDDEN -> HttpStatus.FORBIDDEN;
             case APPROVAL_NOT_FOUND -> HttpStatus.NOT_FOUND;
-            case STALE_APPROVAL, APPROVAL_NOT_PENDING, RUN_NOT_ACTIVE -> HttpStatus.CONFLICT;
+            case STALE_APPROVAL, APPROVAL_NOT_PENDING, RUN_NOT_ACTIVE, STAGE_NOT_REVISABLE -> HttpStatus.CONFLICT;
+            case REVISION_BLOCKED_BY_POLICY -> HttpStatus.UNPROCESSABLE_CONTENT;
         };
         return problem(status, ex.violation().name(), ex.getMessage(), request);
     }

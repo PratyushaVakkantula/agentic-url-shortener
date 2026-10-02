@@ -5,6 +5,7 @@ import com.agentic.orchestration.event.RunEvent;
 import com.agentic.orchestration.event.RunEvent.ApprovalDecided;
 import com.agentic.orchestration.event.RunEvent.ApprovalRequested;
 import com.agentic.orchestration.event.RunEvent.ArtifactProduced;
+import com.agentic.orchestration.event.RunEvent.ArtifactRevised;
 import com.agentic.orchestration.event.RunEvent.AttemptFailed;
 import com.agentic.orchestration.event.RunEvent.DecisionRecorded;
 import com.agentic.orchestration.event.RunEvent.FallbackActivated;
@@ -17,6 +18,7 @@ import com.agentic.orchestration.event.RunEvent.RunResumed;
 import com.agentic.orchestration.event.RunEvent.RunStarted;
 import com.agentic.orchestration.event.RunEvent.StageCompensated;
 import com.agentic.orchestration.event.RunEvent.StageFailed;
+import com.agentic.orchestration.event.RunEvent.StageInvalidated;
 import com.agentic.orchestration.event.RunEvent.StageSkipped;
 import com.agentic.orchestration.event.RunEvent.StageStarted;
 import com.agentic.orchestration.event.RunEvent.StageSucceeded;
@@ -104,6 +106,21 @@ public final class RunState {
                 artifactHistory.add(e.artifact());
                 stage(e.artifact().stageId()).artifactVersion = e.artifact().version();
             }
+            case ArtifactRevised e -> {
+                latestArtifacts.put(e.artifact().stageId(), e.artifact());
+                artifactHistory.add(e.artifact());
+                stage(e.artifact().stageId()).artifactVersion = e.artifact().version();
+            }
+            case StageInvalidated e -> {
+                StageState s = stage(e.stageId());
+                s.status = StageStatus.PENDING;
+                s.generationBase = s.attempts;
+                s.fallbackActive = false;
+                s.invalidations++;
+                s.lastFailure = e.reason();
+                s.lastFailureKind = null;
+                completionOrder.remove(e.stageId());
+            }
             case DecisionRecorded e -> decisions.add(e.decision());
             case PolicyEvaluated e -> stage(e.stageId()).policies.add(
                     new PolicyRecord(e.attempt(), e.policy(), e.category().name(), e.outcome().name(), e.reason()));
@@ -127,6 +144,7 @@ public final class RunState {
                 s.finishedAt = e.at();
                 s.lastFailure = null;
                 s.lastFailureKind = null;
+                completionOrder.remove(e.stageId()); // a re-planned stage moves to its latest completion
                 completionOrder.add(e.stageId());
             }
             case StageFailed e -> {
@@ -181,6 +199,11 @@ public final class RunState {
 
     public synchronized int attempts(String id) {
         return stage(id).attempts;
+    }
+
+    /** Attempts made in the current generation (resets when the stage is invalidated by re-planning). */
+    public synchronized int attemptsInGeneration(String id, int attempt) {
+        return attempt - stage(id).generationBase;
     }
 
     public synchronized boolean fallbackActive(String id) {
@@ -255,7 +278,7 @@ public final class RunState {
     public synchronized RunView view() {
         List<RunView.StageView> stageViews = new ArrayList<>();
         stages.forEach((id, s) -> stageViews.add(new RunView.StageView(id, s.status, s.agent, s.attempts,
-                s.fallbackActive, s.artifactVersion, s.lastFailureKind, s.lastFailure, s.startedAt, s.finishedAt,
+                s.fallbackActive, s.invalidations, s.artifactVersion, s.lastFailureKind, s.lastFailure, s.startedAt, s.finishedAt,
                 List.copyOf(s.gates), List.copyOf(s.policies), s.compensation)));
         return new RunView(runId, workflow, workflowVersion, requirement, initiator, status, statusReason,
                 startedAt, finishedAt, lastSeq, stopRequestedBy, stopReason, stageViews,
@@ -267,6 +290,8 @@ public final class RunState {
         String agent;
         int attempts;
         boolean fallbackActive;
+        int generationBase;
+        int invalidations;
         int artifactVersion;
         FailureKind lastFailureKind;
         String lastFailure;

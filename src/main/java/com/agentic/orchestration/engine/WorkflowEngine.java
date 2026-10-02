@@ -6,6 +6,7 @@ import com.agentic.orchestration.event.RunEventStore;
 import com.agentic.orchestration.event.RunSummary;
 import com.agentic.orchestration.governance.PolicyEngine;
 import com.agentic.orchestration.model.Approval;
+import com.agentic.orchestration.model.Artifact;
 import com.agentic.orchestration.model.Requirement;
 import com.agentic.orchestration.model.RunStatus;
 import com.agentic.orchestration.state.RunState;
@@ -29,6 +30,7 @@ import java.util.concurrent.TimeoutException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
+import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
 /**
@@ -132,6 +134,19 @@ public class WorkflowEngine {
         return await(reply);
     }
 
+    /**
+     * A human revision of a stage's output (OR-12). Downstream stages that consumed the old version
+     * are re-planned automatically.
+     *
+     * @throws GovernanceException if the stage cannot be revised or a policy blocks the content
+     */
+    public Artifact revise(String runId, String stageId, JsonNode content,
+                                                           String actor, String reason) {
+        CompletableFuture<Artifact> reply = new CompletableFuture<>();
+        activeCoordinator(runId).post(new RunCoordinator.ReviseCommand(stageId, content, actor, reason, reply));
+        return await(reply);
+    }
+
     /** Safe-stop (OR-8): idempotent; returns once the stop is recorded, not once the run has ended. */
     public void requestStop(String runId, String actor, String reason) {
         CompletableFuture<Void> reply = new CompletableFuture<>();
@@ -182,6 +197,11 @@ public class WorkflowEngine {
 
     public List<RunSummary> runs() {
         return store.runs();
+    }
+
+    /** Event logs of every run, for reliability metrics (O(total events); see ReliabilityMetrics). */
+    public List<List<RunEvent>> allRunEvents() {
+        return store.runs().stream().map(r -> store.load(r.runId())).toList();
     }
 
     public List<RunEvent> events(String runId) {

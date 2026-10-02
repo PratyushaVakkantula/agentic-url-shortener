@@ -5,6 +5,8 @@ import com.agentic.orchestration.event.RunEventCodec;
 import com.agentic.orchestration.event.RunEventStore;
 import com.agentic.orchestration.governance.Policy;
 import com.agentic.orchestration.governance.PolicyEngine;
+import com.agentic.orchestration.metrics.MeteredRunEventStore;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.util.List;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.annotation.Bean;
@@ -18,9 +20,11 @@ import tools.jackson.databind.json.JsonMapper;
 @Configuration
 public class OrchestrationConfig {
 
+    /** Durable store, decorated with live metrics. */
     @Bean
-    RunEventStore runEventStore(JdbcClient jdbc, PlatformTransactionManager txManager, JsonMapper mapper) {
-        return new JdbcRunEventStore(jdbc, new TransactionTemplate(txManager), new RunEventCodec(mapper));
+    RunEventStore runEventStore(JdbcClient jdbc, PlatformTransactionManager txManager, JsonMapper mapper, MeterRegistry meters) {
+        RunEventStore durable = new JdbcRunEventStore(jdbc, new TransactionTemplate(txManager), new RunEventCodec(mapper));
+        return new MeteredRunEventStore(durable, meters);
     }
 
     @Bean

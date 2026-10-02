@@ -75,6 +75,36 @@ class WorkflowApiIntegrationTest {
                     .stage("release", releaser).requiresApproval("production release").add()
                     .build();
         }
+
+        @Bean
+        WorkflowDefinition reviewWorkflow() {
+            Agent drafter = new Agent() {
+                @Override
+                public String name() {
+                    return "drafter";
+                }
+
+                @Override
+                public AgentResult execute(StageContext ctx) {
+                    return AgentResult.of(Map.of("draft", "v1"));
+                }
+            };
+            Agent publisher = new Agent() {
+                @Override
+                public String name() {
+                    return "publisher";
+                }
+
+                @Override
+                public AgentResult execute(StageContext ctx) {
+                    return AgentResult.of(Map.of("published", ctx.artifact("draft").content().get("draft").asString()));
+                }
+            };
+            return WorkflowDefinition.builder("review", 1)
+                    .stage("draft", drafter).add()
+                    .stage("publish", publisher).dependsOn("draft").requiresApproval("public content").add()
+                    .build();
+        }
     }
 
     @Autowired
@@ -216,6 +246,61 @@ class WorkflowApiIntegrationTest {
 
         org.assertj.core.api.Assertions.assertThat(engine.awaitCompletion(runId, Duration.ofSeconds(10)).status())
                 .isEqualTo(RunStatus.STOPPED);
+    }
+
+    @Test
+    void revisionEndpointReplansAndEnforcesPolicies() throws Exception {
+        String runId = mapper.readTree(mvc.perform(post("/api/v1/workflows/review/runs").with(httpBasic("alice", "alice-pass"))
+                        .contentType(MediaType.APPLICATION_JSON).content(BODY))
+                .andReturn().getResponse().getContentAsString()).get("runId").asString();
+        var first = awaitPendingApproval(runId);
+        String url = "/api/v1/runs/" + runId + "/stages/draft/revisions";
+
+        mvc.perform(post(url).with(httpBasic("alice", "alice-pass")).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"content\": {\"draft\": \"api_key=abcd1234efgh5678\"}, \"reason\": \"x\"}"))
+                .andExpect(status().isUnprocessableContent())
+                .andExpect(jsonPath("$.errorCode").value("REVISION_BLOCKED_BY_POLICY"));
+        mvc.perform(post("/api/v1/runs/" + runId + "/stages/publish/revisions").with(httpBasic("alice", "alice-pass"))
+                        .contentType(MediaType.APPLICATION_JSON).content("{\"content\": {}, \"reason\": \"skip review\"}"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("STAGE_NOT_REVISABLE"));
+        mvc.perform(post(url).with(httpBasic("alice", "alice-pass")).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"content\": {\"draft\": \"v2\"}, \"reason\": \"editor feedback\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.version").value(2));
+
+        tools.jackson.databind.JsonNode second = null;
+        for (int i = 0; i < 200 && second == null; i++) {
+            var candidate = awaitPendingApproval(runId);
+            if (!candidate.get("approvalId").asString().equals(first.get("approvalId").asString())) {
+                second = candidate;
+            } else {
+                Thread.sleep(10);
+            }
+        }
+        org.assertj.core.api.Assertions.assertThat(second).as("publish re-planned with a fresh approval").isNotNull();
+    }
+
+    @Test
+    void reliabilityMetricsAreExposedAsReportAndAsLiveMeters() throws Exception {
+        String runId = mapper.readTree(mvc.perform(post("/api/v1/workflows/demo/runs").with(httpBasic("alice", "alice-pass"))
+                        .contentType(MediaType.APPLICATION_JSON).content(BODY))
+                .andReturn().getResponse().getContentAsString()).get("runId").asString();
+        assertThatRunSucceeds(runId);
+
+        mvc.perform(get("/api/v1/runs/" + runId + "/metrics").with(httpBasic("bob", "bob-pass")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.runs.succeeded").value(1))
+                .andExpect(jsonPath("$.runs.successRate").value(1.0))
+                .andExpect(jsonPath("$.stages.firstPassYield").value(1.0))
+                .andExpect(jsonPath("$.latency.p50Millis").isNumber());
+        mvc.perform(get("/api/v1/metrics").with(httpBasic("bob", "bob-pass")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.runs.total").isNumber())
+                .andExpect(jsonPath("$.recovery.rollbackFrequency").isNumber());
+        mvc.perform(get("/actuator/metrics/orchestration.runs.completed").with(httpBasic("admin", "admin-pass")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.availableTags[*].tag").value(hasItem("status")));
     }
 
     private static String decision(String decision, String hash) {
