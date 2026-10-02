@@ -15,3 +15,4 @@ decision gets a new ADR that supersedes the old one.
 | [0006](0006-durable-event-store-and-recovery.md) | Durable event store and crash recovery | Accepted |
 | [0007](0007-governance-controls.md) | Governance: approvals, policies, retries, rollback, safe-stop | Accepted |
 | [0008](0008-replanning-and-reliability-metrics.md) | Hash-based re-planning and log-derived reliability metrics | Accepted |
+| [0009](0009-deterministic-agents-and-sdlc-workflows.md) | Deterministic agents and the three SDLC workflows | Accepted |
