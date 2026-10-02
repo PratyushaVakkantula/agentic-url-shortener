@@ -18,6 +18,8 @@
 		<springdoc.version>3.1.1</springdoc.version>
 		<archunit.version>1.5.1</archunit.version>
 		<jacoco.version>0.8.15</jacoco.version>
+		<!-- Default so @{argLine} resolves even when JaCoCo is skipped (-Djacoco.skip=true). -->
+		<argLine></argLine>
 	</properties>
 	<dependencies>
 		<dependency>

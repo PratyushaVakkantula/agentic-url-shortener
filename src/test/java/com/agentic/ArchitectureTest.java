@@ -39,6 +39,30 @@ class ArchitectureTest {
             .that().resideInAPackage("com.agentic.shortener..")
             .should().dependOnClassesThat().resideInAPackage("com.agentic.orchestration..");
 
+    /** The orchestrator reasons about other modules through their source files, never their classes. */
+    @ArchTest
+    static final ArchRule orchestrationDoesNotDependOnShortener = noClasses()
+            .that().resideInAPackage("com.agentic.orchestration..")
+            .should().dependOnClassesThat().resideInAPackage("com.agentic.shortener..");
+
+    /**
+     * Autonomy boundary (OR-13), enforced in code: agents see only the read-only StageContext.
+     * They cannot reach the engine, the run state or the event log, so they cannot change
+     * workflow state, approve, or skip governance, however they are implemented.
+     */
+    @ArchTest
+    static final ArchRule agentsCannotReachEngineStateOrEvents = noClasses()
+            .that().resideInAnyPackage("com.agentic.orchestration.agent..", "com.agentic.orchestration.agents..")
+            .should().dependOnClassesThat().resideInAnyPackage(
+                    "com.agentic.orchestration.engine..",
+                    "com.agentic.orchestration.state..",
+                    "com.agentic.orchestration.event..");
+
+    /** Sub-packages of the orchestrator must also be acyclic (definition → agent → model, etc.). */
+    @ArchTest
+    static final ArchRule orchestrationPackagesAreFreeOfCycles =
+            slices().matching("com.agentic.orchestration.(*)..").should().beFreeOfCycles();
+
     /** Only the service layer talks to repositories; keeps transactions and rules in one place. */
     @ArchTest
     static final ArchRule repositoriesAreOnlyUsedByServices = noClasses()
