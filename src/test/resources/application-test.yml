@@ -2,3 +2,12 @@ spring:
   datasource:
     # Isolated in-memory database per test context.
     url: jdbc:h2:mem:test-${random.uuid};DB_CLOSE_DELAY=-1
+app:
+  rate-limit:
+    rules:
+      # Functional tests share one client address; the limiter has its own dedicated test.
+      - name: create-link
+        method: POST
+        path: /api/v1/urls
+        capacity: 100000
+        refill-period: 1m

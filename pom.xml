@@ -50,10 +50,6 @@
 			<artifactId>spring-boot-starter-flyway</artifactId>
 		</dependency>
 		<dependency>
-			<groupId>org.springframework.boot</groupId>
-			<artifactId>spring-boot-starter-cache</artifactId>
-		</dependency>
-		<dependency>
 			<groupId>com.github.ben-manes.caffeine</groupId>
 			<artifactId>caffeine</artifactId>
 		</dependency>
@@ -123,8 +119,10 @@
 				<groupId>org.apache.maven.plugins</groupId>
 				<artifactId>maven-surefire-plugin</artifactId>
 				<configuration>
-					<!-- @{argLine} keeps the JaCoCo agent set by prepare-agent. -->
-					<argLine>@{argLine} -javaagent:${org.mockito:mockito-core:jar} -Xshare:off</argLine>
+					<!-- @{argLine} keeps the JaCoCo agent set by prepare-agent.
+					     Tests deliberately run in a non-UTC zone so hidden "server local time"
+					     assumptions fail here instead of in production. -->
+					<argLine>@{argLine} -javaagent:${org.mockito:mockito-core:jar} -Xshare:off -Duser.timezone=America/New_York</argLine>
 				</configuration>
 			</plugin>
 			<plugin>

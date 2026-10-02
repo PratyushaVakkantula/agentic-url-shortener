@@ -7,6 +7,8 @@ import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.util.Objects;
 
 /**
@@ -28,6 +30,10 @@ public class ClickEvent {
     @Column(name = "occurred_at", nullable = false, updatable = false)
     private Instant occurredAt;
 
+    /** UTC calendar day of {@link #occurredAt}, computed here so DB time-zone settings never matter. */
+    @Column(name = "occurred_day", nullable = false, updatable = false)
+    private LocalDate occurredDay;
+
     @Column(name = "referrer_host", updatable = false)
     private String referrerHost;
 
@@ -41,6 +47,7 @@ public class ClickEvent {
     public ClickEvent(Long linkId, Instant occurredAt, String referrerHost, String userAgentFamily) {
         this.linkId = Objects.requireNonNull(linkId, "linkId");
         this.occurredAt = Objects.requireNonNull(occurredAt, "occurredAt");
+        this.occurredDay = LocalDate.ofInstant(occurredAt, ZoneOffset.UTC);
         this.referrerHost = referrerHost;
         this.userAgentFamily = Objects.requireNonNull(userAgentFamily, "userAgentFamily");
     }
@@ -51,6 +58,10 @@ public class ClickEvent {
 
     public Instant getOccurredAt() {
         return occurredAt;
+    }
+
+    public LocalDate getOccurredDay() {
+        return occurredDay;
     }
 
     public String getReferrerHost() {

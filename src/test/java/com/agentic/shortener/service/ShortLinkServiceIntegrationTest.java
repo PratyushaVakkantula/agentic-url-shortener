@@ -8,6 +8,7 @@ import com.agentic.shortener.domain.CodeSpaceExhaustedException;
 import com.agentic.shortener.domain.InvalidLinkRequestException;
 import com.agentic.shortener.domain.ShortLink;
 import com.agentic.shortener.repository.ShortLinkRepository;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.net.URI;
 import java.time.Clock;
 import java.time.Duration;
@@ -45,6 +46,9 @@ class ShortLinkServiceIntegrationTest {
     private static final Clock CLOCK = Clock.fixed(NOW, ZoneOffset.UTC);
     private static final ShortenerProperties PROPS =
             new ShortenerProperties(URI.create("http://localhost:8080"), 7, 3, Duration.ofDays(365));
+    private static final ShortenerRuntimeProperties RUNTIME = new ShortenerRuntimeProperties(
+            new ShortenerRuntimeProperties.CacheSettings(100, Duration.ofMinutes(1)),
+            new ShortenerRuntimeProperties.ClickTrackingSettings(100, 10, Duration.ofMillis(50)));
 
     @Autowired
     ShortLinkRepository repository;
@@ -55,7 +59,8 @@ class ShortLinkServiceIntegrationTest {
     }
 
     private ShortLinkService service(ShortCodeGenerator generator) {
-        return new ShortLinkService(repository, generator, new UrlSafetyValidator(), new AliasPolicy(), PROPS, CLOCK);
+        return new ShortLinkService(repository, generator, new UrlSafetyValidator(), new AliasPolicy(), PROPS,
+                new RedirectCache(RUNTIME, repository, new SimpleMeterRegistry()), CLOCK);
     }
 
     private static ShortCodeGenerator scripted(String... codes) {

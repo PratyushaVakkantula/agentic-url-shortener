@@ -9,8 +9,20 @@ spring:
     url: ${DB_URL:jdbc:h2:file:./data/shortener}
     username: ${DB_USER:sa}
     password: ${DB_PASSWORD:}
+    hikari:
+      # Every DB session runs in UTC, so any date/time conversion inside SQL is unambiguous.
+      # Same statement works on H2 and PostgreSQL.
+      connection-init-sql: SET TIME ZONE 'UTC'
   jpa:
     open-in-view: false
+    properties:
+      # Time handling is zone-independent end to end:
+      # - DB sessions run in UTC (connection-init-sql above)
+      # - Hibernate binds/reads java.time values directly (setObject/getObject) instead of the
+      #   legacy java.sql.Date/Timestamp API, which shifts dates by a day when the JVM zone and
+      #   the session zone differ (verified with a JDBC probe; see ADR-0004).
+      hibernate.type.java_time_use_direct_jdbc: true
+      hibernate.jdbc.time_zone: UTC
     hibernate:
       # Flyway owns the schema; Hibernate only verifies the mapping matches it.
       ddl-auto: validate
@@ -51,6 +63,24 @@ logging:
     correlation: "[req=%X{requestId:-} run=%X{runId:-}] "
 
 app:
+  shortener:
+    base-url: ${PUBLIC_BASE_URL:http://localhost:8080}
+    redirect-cache:
+      max-size: 10000
+      ttl: 10m
+    click-tracking:
+      queue-capacity: 10000
+      batch-size: 500
+      flush-interval: 200ms
+  rate-limit:
+    enabled: true
+    rules:
+      # Link creation is the abuse-prone write path; redirects are left unthrottled (read path, cached).
+      - name: create-link
+        method: POST
+        path: /api/v1/urls
+        capacity: 30
+        refill-period: 1m
   security:
     # Demo users. Passwords are bcrypt hashes; plaintext demo values are documented in the README.
     # In production these come from an identity provider (OIDC), not from config.
