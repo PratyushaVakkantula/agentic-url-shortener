@@ -40,6 +40,12 @@ class RequirementsAnalystAgentTest {
     }
 
     @Test
+    void acronymsSurviveKeywordExtractionDespiteBeingShort() {
+        assertThat(analyst.analyse(new Requirement("QR codes for short links", "The API must return a PNG.")).keywords())
+                .startsWith("qr", "code").contains("api", "png");
+    }
+
+    @Test
     void eachQualityIsAskedAboutOnceEvenWhenMentionedRepeatedly() {
         Analysis a = analyst.analyse(new Requirement("Speed", "It must be fast. Really quick. Performant under load."));
         assertThat(a.ambiguities()).filteredOn(x -> x.quality().equals("performance")).hasSize(1);

@@ -14,6 +14,8 @@ final class Text {
 
     private static final Pattern SENTENCE_SPLIT = Pattern.compile("(?<=[.!?;])\\s+|\\R+|\\s+-\\s+|^\\s*[-*]\\s+", Pattern.MULTILINE);
     private static final Pattern WORD = Pattern.compile("[A-Za-z][A-Za-z-]+");
+    /** Short all-caps words (QR, URL, API, SLA) carry meaning despite their length. */
+    private static final Pattern ACRONYM = Pattern.compile("[A-Z]{2,5}");
     private static final Pattern CAMEL = Pattern.compile("(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|[_\\-/{}.:\\s]+");
 
     static final Set<String> STOPWORDS = Set.of(
@@ -40,8 +42,12 @@ final class Text {
         Set<String> out = new LinkedHashSet<>();
         var m = WORD.matcher(text == null ? "" : text);
         while (m.find()) {
-            for (String part : m.group().toLowerCase(Locale.ROOT).split("-")) {
-                String w = stem(part);
+            for (String part : m.group().split("-")) {
+                if (ACRONYM.matcher(part).matches()) {
+                    out.add(part.toLowerCase(Locale.ROOT));
+                    continue;
+                }
+                String w = stem(part.toLowerCase(Locale.ROOT));
                 if (w.length() >= 4 && !STOPWORDS.contains(w)) {
                     out.add(w);
                 }

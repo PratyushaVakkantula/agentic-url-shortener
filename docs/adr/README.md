@@ -16,3 +16,4 @@ decision gets a new ADR that supersedes the old one.
 | [0007](0007-governance-controls.md) | Governance: approvals, policies, retries, rollback, safe-stop | Accepted |
 | [0008](0008-replanning-and-reliability-metrics.md) | Hash-based re-planning and log-derived reliability metrics | Accepted |
 | [0009](0009-deterministic-agents-and-sdlc-workflows.md) | Deterministic agents and the three SDLC workflows | Accepted |
+| [0010](0010-durability-of-committed-events.md) | Committed events must survive a hard crash | Accepted |

@@ -6,7 +6,9 @@ spring:
       enabled: true
   datasource:
     # File-based so workflow runs (event-sourced) survive restarts. Swap for Postgres via env vars.
-    url: ${DB_URL:jdbc:h2:file:./data/shortener}
+    # WRITE_DELAY=0: H2 otherwise buffers commits for ~0.5 s, and a hard kill (kill -9, OOM-killer)
+    # loses committed transactions, i.e. audit events. Proven by DurabilityTest; see ADR-0010.
+    url: ${DB_URL:jdbc:h2:file:./data/shortener;WRITE_DELAY=0}
     username: ${DB_USER:sa}
     password: ${DB_PASSWORD:}
     hikari:

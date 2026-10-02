@@ -124,9 +124,11 @@ public class ArchitectAgent implements Agent {
             }
             risks.add("existing tests " + Json.strings(impact, "existingTests") + " must keep passing (regression)");
         } else {
-            String module = keywords.isEmpty() ? "feature" : Text.stem(keywords.getFirst()).replace("-", "");
+            // Name after the first two keywords, e.g. "QR codes for short links" → module qrcode, entity QrCode.
+            String phrase = keywords.isEmpty() ? "feature" : String.join("_", keywords.stream().limit(2).map(Text::stem).toList());
+            String module = phrase.replace("_", "");
             String pkg = "src/main/java/com/agentic/" + module;
-            String entity = Text.pascal(module);
+            String entity = Text.pascal(phrase);
             approach = "New module '" + module + "' following the existing layering (domain → repository → service → api)";
             components.add(new Component(entity, "entity", "ADD", pkg + "/domain/" + entity + ".java", "core aggregate"));
             components.add(new Component(entity + "Repository", "repository", "ADD", pkg + "/repository/" + entity + "Repository.java", "persistence"));
