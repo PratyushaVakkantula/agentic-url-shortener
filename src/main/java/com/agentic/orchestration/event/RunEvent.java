@@ -1,6 +1,10 @@
 package com.agentic.orchestration.event;
 
+import com.agentic.orchestration.governance.PolicyCategory;
+import com.agentic.orchestration.governance.PolicyOutcome;
+import com.agentic.orchestration.model.ApprovalStatus;
 import com.agentic.orchestration.model.Artifact;
+import com.agentic.orchestration.model.ArtifactRef;
 import com.agentic.orchestration.model.Decision;
 import com.agentic.orchestration.model.Requirement;
 import com.agentic.orchestration.model.RunStatus;
@@ -39,6 +43,43 @@ public sealed interface RunEvent {
     }
 
     record DecisionRecorded(String runId, long seq, Instant at, Decision decision) implements RunEvent {
+    }
+
+    record PolicyEvaluated(String runId, long seq, Instant at, String stageId, int attempt, String policy,
+                           PolicyCategory category, PolicyOutcome outcome, String reason) implements RunEvent {
+    }
+
+    /** A non-terminal failure: a retry or fallback follows. Terminal failures are {@link StageFailed}. */
+    record AttemptFailed(String runId, long seq, Instant at, String stageId, int attempt,
+                         FailureKind kind, String reason) implements RunEvent {
+    }
+
+    record RetryScheduled(String runId, long seq, Instant at, String stageId, int nextAttempt,
+                          long delayMillis) implements RunEvent {
+    }
+
+    record FallbackActivated(String runId, long seq, Instant at, String stageId, String fallbackAgent,
+                             String reason) implements RunEvent {
+    }
+
+    record ApprovalRequested(String runId, long seq, Instant at, String approvalId, String stageId, int attempt,
+                             ArtifactRef artifact, List<String> reasons, Instant expiresAt) implements RunEvent {
+    }
+
+    record ApprovalDecided(String runId, long seq, Instant at, String approvalId, String stageId,
+                           ApprovalStatus decision, String actor, String comment) implements RunEvent {
+    }
+
+    /** Safe-stop (OR-8): no new work starts; in-flight work finishes; the run ends STOPPED. */
+    record StopRequested(String runId, long seq, Instant at, String actor, String reason) implements RunEvent {
+    }
+
+    /** Rollback plan (OR-7): succeeded stages with compensations, in the order they will be undone. */
+    record RollbackStarted(String runId, long seq, Instant at, List<String> stages) implements RunEvent {
+    }
+
+    record StageCompensated(String runId, long seq, Instant at, String stageId, boolean succeeded,
+                            String detail) implements RunEvent {
     }
 
     record StageSucceeded(String runId, long seq, Instant at, String stageId, int attempt,

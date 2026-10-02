@@ -13,6 +13,7 @@ import com.agentic.orchestration.event.ConcurrentRunModificationException;
 import com.agentic.orchestration.event.RunEvent;
 import com.agentic.orchestration.event.RunEventStore;
 import com.agentic.orchestration.event.RunSummary;
+import com.agentic.orchestration.governance.PolicyEngine;
 import com.agentic.orchestration.model.Requirement;
 import com.agentic.orchestration.model.RunStatus;
 import com.agentic.orchestration.model.StageStatus;
@@ -21,6 +22,7 @@ import com.agentic.orchestration.state.RunView;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
@@ -49,7 +51,7 @@ class RecoveryIntegrationTest {
     @Autowired
     JsonMapper mapper;
 
-    private final List<WorkflowEngine> engines = new java.util.ArrayList<>();
+    private final List<WorkflowEngine> engines = new ArrayList<>();
 
     @AfterEach
     void stopEngines() {
@@ -57,7 +59,8 @@ class RecoveryIntegrationTest {
     }
 
     private WorkflowEngine process(WorkflowDefinition... deployed) {
-        WorkflowEngine engine = new WorkflowEngine(store, new WorkflowCatalog(List.of(deployed)), mapper, Clock.systemUTC());
+        WorkflowEngine engine = new WorkflowEngine(store, new WorkflowCatalog(List.of(deployed)), PolicyEngine.none(),
+                new GovernanceSettings(Duration.ofSeconds(30), Duration.ofHours(1)), mapper, Clock.systemUTC());
         engines.add(engine);
         return engine;
     }
@@ -170,6 +173,29 @@ class RecoveryIntegrationTest {
         RunView view = second.get(runId);
         assertThat(view.status()).isEqualTo(RunStatus.FAILED);
         assertThat(view.statusReason()).contains("evolving v1 is no longer deployed");
+    }
+
+    /** A checkpoint can be open for days; a deploy in between must not lose it (OR-5 + OR-15). */
+    @Test
+    void openApprovalSurvivesRestartAndCanBeDecidedOnTheNewProcess() throws Exception {
+        WorkflowDefinition wf = WorkflowDefinition.builder("gated", 1)
+                .stage("release", emitting("releaser", Map.of("version", "2.0.0"))).requiresApproval("production release").add()
+                .stage("announce", emitting("announcer", Map.of())).dependsOn("release").add()
+                .build();
+        WorkflowEngine first = process(wf);
+        String runId = first.start(wf, REQ, "alice");
+        RunView waiting = TestAgents.awaitStage(first, runId, "release", StageStatus.AWAITING_APPROVAL);
+        var approval = waiting.approvals().getFirst();
+        first.shutdown();
+
+        WorkflowEngine second = process(wf);
+        second.resumeUnfinishedRuns();
+        second.decide(runId, approval.approvalId(), true, "bob", approval.artifact().contentHash(), "approved after deploy");
+        RunView done = second.awaitCompletion(runId, WAIT);
+
+        assertThat(done.status()).isEqualTo(RunStatus.SUCCEEDED);
+        assertThat(done.stage("release").attempts()).as("approved output reused, not regenerated").isEqualTo(1);
+        assertThat(done.approvals().getFirst().decidedBy()).isEqualTo("bob");
     }
 
     @Test

@@ -1,5 +1,6 @@
 package com.agentic.orchestration.api;
 
+import com.agentic.orchestration.engine.GovernanceException;
 import com.agentic.orchestration.engine.UnknownRunException;
 import com.agentic.orchestration.engine.UnknownWorkflowException;
 import com.agentic.platform.web.ApiProblem;
@@ -24,6 +25,16 @@ public class OrchestrationExceptionHandler {
     @ExceptionHandler(UnknownRunException.class)
     ResponseEntity<ProblemDetail> unknownRun(UnknownRunException ex, HttpServletRequest request) {
         return problem(HttpStatus.NOT_FOUND, "RUN_NOT_FOUND", ex.getMessage(), request);
+    }
+
+    @ExceptionHandler(GovernanceException.class)
+    ResponseEntity<ProblemDetail> governance(GovernanceException ex, HttpServletRequest request) {
+        HttpStatus status = switch (ex.violation()) {
+            case SELF_APPROVAL_FORBIDDEN -> HttpStatus.FORBIDDEN;
+            case APPROVAL_NOT_FOUND -> HttpStatus.NOT_FOUND;
+            case STALE_APPROVAL, APPROVAL_NOT_PENDING, RUN_NOT_ACTIVE -> HttpStatus.CONFLICT;
+        };
+        return problem(status, ex.violation().name(), ex.getMessage(), request);
     }
 
     private static ResponseEntity<ProblemDetail> problem(HttpStatus status, String code, String detail, HttpServletRequest request) {

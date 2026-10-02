@@ -13,6 +13,7 @@ import com.agentic.orchestration.definition.WorkflowDefinition;
 import com.agentic.orchestration.event.FailureKind;
 import com.agentic.orchestration.event.InMemoryRunEventStore;
 import com.agentic.orchestration.event.RunEvent;
+import com.agentic.orchestration.governance.PolicyEngine;
 import com.agentic.orchestration.model.Artifact;
 import com.agentic.orchestration.model.Decision;
 import com.agentic.orchestration.model.Requirement;
@@ -38,7 +39,8 @@ class WorkflowEngineTest {
     private static final Requirement REQ = new Requirement("Add expiry to links", "Links should expire.");
 
     private final InMemoryRunEventStore store = new InMemoryRunEventStore();
-    private final WorkflowEngine engine = new WorkflowEngine(store, new WorkflowCatalog(List.of()), JsonMapper.builder().build(), Clock.systemUTC());
+    private final WorkflowEngine engine = new WorkflowEngine(store, new WorkflowCatalog(List.of()), PolicyEngine.none(),
+            new GovernanceSettings(Duration.ofSeconds(30), Duration.ofHours(1)), JsonMapper.builder().build(), Clock.systemUTC());
 
     @AfterEach
     void shutdown() {

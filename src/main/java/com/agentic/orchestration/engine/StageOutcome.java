@@ -1,6 +1,7 @@
 package com.agentic.orchestration.engine;
 
 import com.agentic.orchestration.event.FailureKind;
+import com.agentic.orchestration.governance.PolicyDecision;
 import com.agentic.orchestration.model.Decision;
 import java.util.List;
 import tools.jackson.databind.JsonNode;
@@ -13,7 +14,7 @@ sealed interface StageOutcome extends RunCoordinator.Signal {
     int attempt();
 
     record Completed(String stageId, int attempt, JsonNode output, List<Decision> decisions,
-                     List<GateCheck> exitGates, long durationMillis) implements StageOutcome {
+                     List<GateCheck> exitGates, List<PolicyDecision> policies, long durationMillis) implements StageOutcome {
     }
 
     record Errored(String stageId, int attempt, FailureKind kind, String reason,

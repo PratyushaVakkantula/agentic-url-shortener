@@ -4,6 +4,8 @@ import com.agentic.orchestration.definition.WorkflowDefinition;
 import com.agentic.orchestration.event.RunEvent;
 import com.agentic.orchestration.event.RunEventStore;
 import com.agentic.orchestration.event.RunSummary;
+import com.agentic.orchestration.governance.PolicyEngine;
+import com.agentic.orchestration.model.Approval;
 import com.agentic.orchestration.model.Requirement;
 import com.agentic.orchestration.model.RunStatus;
 import com.agentic.orchestration.state.RunState;
@@ -16,10 +18,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import org.slf4j.Logger;
@@ -37,16 +41,26 @@ public class WorkflowEngine {
 
     private static final Logger log = LoggerFactory.getLogger(WorkflowEngine.class);
 
+    private static final Duration COMMAND_TIMEOUT = Duration.ofSeconds(10);
+
     private final RunEventStore store;
     private final WorkflowCatalog catalog;
+    private final PolicyEngine policies;
+    private final GovernanceSettings settings;
     private final JsonMapper mapper;
     private final Clock clock;
     private final ExecutorService agentExecutor = Executors.newVirtualThreadPerTaskExecutor();
+    /** Timers only post signals to mailboxes, so one thread serves every run. */
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(
+            r -> Thread.ofPlatform().name("orchestration-timers").daemon(true).unstarted(r));
     private final Map<String, RunCoordinator> live = new ConcurrentHashMap<>();
 
-    public WorkflowEngine(RunEventStore store, WorkflowCatalog catalog, JsonMapper mapper, Clock clock) {
+    public WorkflowEngine(RunEventStore store, WorkflowCatalog catalog, PolicyEngine policies,
+                          GovernanceSettings settings, JsonMapper mapper, Clock clock) {
         this.store = store;
         this.catalog = catalog;
+        this.policies = policies;
+        this.settings = settings;
         this.mapper = mapper;
         this.clock = clock;
     }
@@ -105,6 +119,53 @@ public class WorkflowEngine {
         return resumed;
     }
 
+    /**
+     * A human decision on a checkpoint. Validated by the run's own coordinator (single writer), so
+     * the checks (pending? initiator? artifact hash?) cannot race with the run's progress.
+     *
+     * @throws GovernanceException when the decision violates a governance rule
+     */
+    public Approval decide(String runId, String approvalId, boolean approve, String actor, String artifactHash,
+                           String comment) {
+        CompletableFuture<Approval> reply = new CompletableFuture<>();
+        activeCoordinator(runId).post(new RunCoordinator.ApprovalCommand(approvalId, approve, actor, artifactHash, comment, reply));
+        return await(reply);
+    }
+
+    /** Safe-stop (OR-8): idempotent; returns once the stop is recorded, not once the run has ended. */
+    public void requestStop(String runId, String actor, String reason) {
+        CompletableFuture<Void> reply = new CompletableFuture<>();
+        activeCoordinator(runId).post(new RunCoordinator.StopCommand(actor, reason, reply));
+        await(reply);
+    }
+
+    private RunCoordinator activeCoordinator(String runId) {
+        RunCoordinator coordinator = live.get(runId);
+        if (coordinator == null || coordinator.isFinished()) {
+            if (store.load(runId).isEmpty()) {
+                throw new UnknownRunException(runId);
+            }
+            throw new GovernanceException(GovernanceException.Violation.RUN_NOT_ACTIVE, "Run " + runId + " is not active");
+        }
+        return coordinator;
+    }
+
+    private static <T> T await(CompletableFuture<T> reply) {
+        try {
+            return reply.get(COMMAND_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (ExecutionException e) {
+            if (e.getCause() instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            throw new IllegalStateException(e.getCause());
+        } catch (TimeoutException e) {
+            throw new IllegalStateException("Run did not respond within " + COMMAND_TIMEOUT, e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(e);
+        }
+    }
+
     /** Live runs come from their coordinator; finished or foreign runs are rebuilt from the log. */
     public Optional<RunView> find(String runId) {
         RunCoordinator coordinator = live.get(runId);
@@ -159,9 +220,10 @@ public class WorkflowEngine {
             }
         }
         agentExecutor.shutdownNow();
+        scheduler.shutdownNow();
     }
 
     private RunCoordinator newCoordinator(String runId, WorkflowDefinition definition) {
-        return new RunCoordinator(runId, definition, store, agentExecutor, mapper, clock);
+        return new RunCoordinator(runId, definition, store, agentExecutor, scheduler, policies, settings, mapper, clock);
     }
 }

@@ -1,13 +1,17 @@
 package com.agentic.orchestration.engine;
 
+import com.agentic.orchestration.agent.Agent;
 import com.agentic.orchestration.agent.AgentResult;
 import com.agentic.orchestration.agent.ContextAccessException;
 import com.agentic.orchestration.agent.StageContext;
+import com.agentic.orchestration.definition.CompensationContext;
 import com.agentic.orchestration.definition.Gate;
 import com.agentic.orchestration.definition.GateInput;
 import com.agentic.orchestration.definition.GateResult;
+import com.agentic.orchestration.definition.RetryPolicy;
 import com.agentic.orchestration.definition.StageDefinition;
 import com.agentic.orchestration.definition.WorkflowDefinition;
+import com.agentic.orchestration.engine.GovernanceException.Violation;
 import com.agentic.orchestration.engine.StageOutcome.Completed;
 import com.agentic.orchestration.engine.StageOutcome.Errored;
 import com.agentic.orchestration.engine.StageOutcome.GateCheck;
@@ -15,6 +19,12 @@ import com.agentic.orchestration.event.FailureKind;
 import com.agentic.orchestration.event.GateKind;
 import com.agentic.orchestration.event.RunEvent;
 import com.agentic.orchestration.event.RunEventStore;
+import com.agentic.orchestration.governance.PolicyDecision;
+import com.agentic.orchestration.governance.PolicyEngine;
+import com.agentic.orchestration.governance.PolicyInput;
+import com.agentic.orchestration.governance.PolicyOutcome;
+import com.agentic.orchestration.model.Approval;
+import com.agentic.orchestration.model.ApprovalStatus;
 import com.agentic.orchestration.model.Artifact;
 import com.agentic.orchestration.model.ArtifactRef;
 import com.agentic.orchestration.model.Decision;
@@ -25,14 +35,20 @@ import com.agentic.orchestration.state.RunState;
 import com.agentic.orchestration.state.RunView;
 import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.function.LongFunction;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -42,37 +58,68 @@ import tools.jackson.databind.json.JsonMapper;
 
 /**
  * Drives one workflow run. An <b>actor</b>: a single coordinator thread owns the run's state and
- * processes {@link Signal}s from a mailbox one at a time, while agents execute concurrently on
- * a shared virtual-thread pool and report back by posting {@link StageOutcome}s.
+ * processes {@link Signal}s from a mailbox one at a time. Agents execute concurrently on a shared
+ * virtual-thread pool; timers (timeouts, retry backoff, approval expiry) and humans (approvals,
+ * stop requests) also just post signals. Nothing else ever touches run state.
  *
- * <p>Consequences of this design:
- * <ul>
- *   <li>No locks around workflow state and no races between parallel stages: only this thread
- *       writes, and it handles one fact at a time.</li>
- *   <li><b>Write-ahead events:</b> every change is appended to the {@link RunEventStore} first and
- *       then applied to {@link RunState}; state is never ahead of the log.</li>
- *   <li>Fan-in synchronisation (OR-3) is implicit: a stage is dispatched only when <i>all</i> of its
- *       dependencies have SUCCEEDED, re-checked after every outcome.</li>
- * </ul>
+ * <p>Every change is appended to the {@link RunEventStore} first and then applied to
+ * {@link RunState} (write-ahead), so the audit log is always at least as current as state.
  *
- * <p>Failure policy: <b>fail fast</b>. After any stage fails, no new stage is started; in-flight
- * stages finish and are recorded; everything still pending is SKIPPED, and the run FAILS.
+ * <h2>Governance flow of one stage attempt</h2>
+ * <pre>
+ *  entry gates ─fail─▶ FAILED (not retried)
+ *      │ pass
+ *  agent runs ──error / timeout──┐
+ *      │                         │
+ *  exit gates ──fail─────────────┤──▶ retry with backoff ─▶ fallback agent ─▶ FAILED
+ *      │ pass
+ *  policies ──BLOCK──▶ FAILED + safe-stop of the run
+ *      │ REQUIRE_APPROVAL, or stage marked high-impact
+ *      ├──────────────▶ AWAITING_APPROVAL ─approve─▶ SUCCEEDED / ─reject|expire─▶ FAILED
+ *      │ ALLOW
+ *  SUCCEEDED
+ * </pre>
+ * Run level: fail fast (no new stages after a failure), then roll back succeeded stages in
+ * reverse completion order. Safe-stop never rolls back: it preserves state for investigation.
  */
 final class RunCoordinator {
 
     private static final Logger log = LoggerFactory.getLogger(RunCoordinator.class);
+    private static final String SYSTEM = "system";
 
-    /** Messages the coordinator reacts to. Stage outcomes now; approvals and stop requests later. */
-    sealed interface Signal permits Schedule, StageOutcome {
+    sealed interface Signal permits Schedule, StageOutcome, AttemptTimedOut, RetryDue, ApprovalCommand,
+            ApprovalExpired, StopCommand, CompensationFinished {
     }
 
     record Schedule() implements Signal {
+    }
+
+    record AttemptTimedOut(String stageId, int attempt) implements Signal {
+    }
+
+    record RetryDue(String stageId) implements Signal {
+    }
+
+    record ApprovalCommand(String approvalId, boolean approve, String actor, String artifactHash, String comment,
+                           CompletableFuture<Approval> reply) implements Signal {
+    }
+
+    record ApprovalExpired(String approvalId) implements Signal {
+    }
+
+    record StopCommand(String actor, String reason, CompletableFuture<Void> reply) implements Signal {
+    }
+
+    record CompensationFinished(String stageId, boolean succeeded, String detail) implements Signal {
     }
 
     private final String runId;
     private final WorkflowDefinition definition;
     private final RunEventStore store;
     private final ExecutorService agentExecutor;
+    private final ScheduledExecutorService scheduler;
+    private final PolicyEngine policies;
+    private final GovernanceSettings settings;
     private final JsonMapper mapper;
     private final ContentHasher hasher;
     private final Clock clock;
@@ -81,46 +128,63 @@ final class RunCoordinator {
     private final CompletableFuture<RunView> completion = new CompletableFuture<>();
     private volatile Thread thread;
 
+    // Owned by the coordinator thread only; rebuilt from state on resume.
+    private final Map<String, Future<?>> inflight = new HashMap<>();
+    private final Map<String, ScheduledFuture<?>> timers = new HashMap<>();
+    private boolean compensating;
+
     RunCoordinator(String runId, WorkflowDefinition definition, RunEventStore store, ExecutorService agentExecutor,
+                   ScheduledExecutorService scheduler, PolicyEngine policies, GovernanceSettings settings,
                    JsonMapper mapper, Clock clock) {
         this.runId = runId;
         this.definition = definition;
         this.store = store;
         this.agentExecutor = agentExecutor;
+        this.scheduler = scheduler;
+        this.policies = policies;
+        this.settings = settings;
         this.mapper = mapper;
         this.hasher = new ContentHasher(mapper);
         this.clock = clock;
     }
 
+    // ------------------------------------------------------------------ lifecycle (any thread)
+
     void start(Requirement requirement, String initiator) {
-        emit(seq -> new RunEvent.RunStarted(runId, seq, clock.instant(), definition.name(), definition.version(),
+        emit(seq -> new RunEvent.RunStarted(runId, seq, now(), definition.name(), definition.version(),
                 requirement, initiator, definition.topologicalOrder()));
-        mailbox.add(new Schedule());
-        thread = Thread.ofVirtual().name("run-" + runId).start(this::loop);
+        launch();
     }
 
     /**
-     * Continues a run from its persisted history after a restart (OR-15): rebuild state by
-     * replay, record which stages were interrupted, then schedule as usual.
+     * Continues a run from its persisted history after a restart (OR-15): rebuild state by replay,
+     * record which stages were interrupted, re-arm timers for retries and open approvals.
      */
     void resume(List<RunEvent> history) {
         history.forEach(state::apply);
         List<String> interrupted = state.stagesWithStatus(StageStatus.RUNNING);
-        emit(seq -> new RunEvent.RunResumed(runId, seq, clock.instant(), interrupted));
-        mailbox.add(new Schedule());
-        thread = Thread.ofVirtual().name("run-" + runId).start(this::loop);
+        emit(seq -> new RunEvent.RunResumed(runId, seq, now(), interrupted));
+        state.stagesWithStatus(StageStatus.WAITING_RETRY).forEach(id -> arm("retry:" + id, Duration.ZERO, new RetryDue(id)));
+        state.pendingApprovals().forEach(a -> arm("approval:" + a.approvalId(),
+                Duration.between(now(), a.expiresAt()), new ApprovalExpired(a.approvalId())));
+        launch();
     }
 
-    /**
-     * Stops the coordinator <b>without writing anything</b>, exactly as if the process died.
-     * Shutdown and crash therefore leave the same durable state, and recovery is one tested path.
-     */
+    /** Stops without writing anything, exactly as if the process died (see ADR-0006). */
     void stop() throws InterruptedException {
         Thread t = thread;
         if (t != null) {
             t.interrupt();
             t.join(Duration.ofSeconds(5));
         }
+    }
+
+    void post(Signal signal) {
+        mailbox.add(signal);
+    }
+
+    boolean isFinished() {
+        return completion.isDone();
     }
 
     RunView view() {
@@ -131,25 +195,29 @@ final class RunCoordinator {
         return completion;
     }
 
+    private void launch() {
+        mailbox.add(new Schedule());
+        thread = Thread.ofVirtual().name("run-" + runId).start(this::loop);
+    }
+
     // ------------------------------------------------------------------ coordinator thread
 
     private void loop() {
         MDC.put("runId", runId);
         try {
             while (!state.status().isTerminal()) {
-                Signal signal = mailbox.take();
-                handle(signal);
+                handle(mailbox.take());
             }
             completion.complete(state.view());
         } catch (InterruptedException e) {
-            // Shutdown: leave the run as RUNNING in the store; it is resumed on next start.
             Thread.currentThread().interrupt();
-            completion.completeExceptionally(new IllegalStateException("engine stopped; run " + runId + " will resume on restart"));
+            completion.completeExceptionally(new IllegalStateException("engine stopped; run " + runId + " resumes on restart"));
         } catch (RuntimeException e) {
-            // A coordinator bug must not leave callers waiting forever.
             log.error("Coordinator for run {} crashed", runId, e);
             completion.completeExceptionally(e);
         } finally {
+            timers.values().forEach(t -> t.cancel(false));
+            rejectPendingCommands();
             MDC.remove("runId");
         }
     }
@@ -159,41 +227,204 @@ final class RunCoordinator {
             case Schedule s -> schedule();
             case Completed c -> onCompleted(c);
             case Errored e -> onErrored(e);
+            case AttemptTimedOut t -> onTimeout(t);
+            case RetryDue r -> onRetryDue(r.stageId());
+            case ApprovalCommand a -> onApprovalCommand(a);
+            case ApprovalExpired x -> onApprovalExpired(x.approvalId());
+            case StopCommand s -> onStop(s);
+            case CompensationFinished f -> onCompensationFinished(f);
         }
     }
 
-    private void onCompleted(Completed outcome) {
-        String stageId = outcome.stageId();
-        Artifact previous = state.latestArtifact(stageId);
-        int version = previous == null ? 1 : previous.version() + 1;
-        Artifact artifact = new Artifact(stageId, version, hasher.hash(outcome.output()), outcome.output(), clock.instant());
+    // ---- stage outcomes ----
 
-        emit(seq -> new RunEvent.ArtifactProduced(runId, seq, clock.instant(), artifact));
-        outcome.decisions().forEach(d -> emit(seq -> new RunEvent.DecisionRecorded(runId, seq, clock.instant(), d)));
-        outcome.exitGates().forEach(g -> emit(seq -> new RunEvent.GateEvaluated(runId, seq, clock.instant(),
-                stageId, GateKind.EXIT, g.gate(), g.passed(), g.reason())));
+    private void onCompleted(Completed outcome) {
+        String id = outcome.stageId();
+        if (!isCurrentAttempt(id, outcome.attempt())) {
+            log.info("Discarding late outcome of {} attempt {} (already timed out or superseded)", id, outcome.attempt());
+            return;
+        }
+        endAttempt(id);
+        StageDefinition stage = definition.stage(id);
+
+        Artifact previous = state.latestArtifact(id);
+        Artifact artifact = new Artifact(id, previous == null ? 1 : previous.version() + 1,
+                hasher.hash(outcome.output()), outcome.output(), now());
+        emit(seq -> new RunEvent.ArtifactProduced(runId, seq, now(), artifact));
+        outcome.decisions().forEach(d -> emit(seq -> new RunEvent.DecisionRecorded(runId, seq, now(), d)));
+        outcome.exitGates().forEach(g -> emit(seq -> new RunEvent.GateEvaluated(runId, seq, now(), id, GateKind.EXIT,
+                g.gate(), g.passed(), g.reason())));
+        outcome.policies().forEach(p -> emit(seq -> new RunEvent.PolicyEvaluated(runId, seq, now(), id,
+                outcome.attempt(), p.policy(), p.category(), p.outcome(), p.reason())));
 
         List<String> failedGates = outcome.exitGates().stream().filter(g -> !g.passed())
                 .map(g -> g.gate() + ": " + g.reason()).toList();
-        if (failedGates.isEmpty()) {
-            emit(seq -> new RunEvent.StageSucceeded(runId, seq, clock.instant(), stageId, outcome.attempt(),
-                    outcome.durationMillis()));
+        if (!failedGates.isEmpty()) {
+            failAttempt(id, outcome.attempt(), FailureKind.EXIT_GATE, String.join("; ", failedGates));
+        } else if (PolicyEngine.mostSevere(outcome.policies()) == PolicyOutcome.BLOCK) {
+            String reason = summarize(outcome.policies(), PolicyOutcome.BLOCK);
+            emit(seq -> new RunEvent.StageFailed(runId, seq, now(), id, outcome.attempt(), FailureKind.POLICY_BLOCKED, reason));
+            requestStop("policy-engine", "output of stage '" + id + "' blocked: " + reason);
         } else {
-            emit(seq -> new RunEvent.StageFailed(runId, seq, clock.instant(), stageId, outcome.attempt(),
-                    FailureKind.EXIT_GATE, String.join("; ", failedGates)));
+            List<String> approvalReasons = new ArrayList<>();
+            if (stage.policy().requiresApproval()) {
+                approvalReasons.add("high-impact stage: " + stage.policy().approvalReason());
+            }
+            outcome.policies().stream().filter(p -> p.outcome() == PolicyOutcome.REQUIRE_APPROVAL)
+                    .forEach(p -> approvalReasons.add(p.category() + "/" + p.policy() + ": " + p.reason()));
+            if (approvalReasons.isEmpty()) {
+                emit(seq -> new RunEvent.StageSucceeded(runId, seq, now(), id, outcome.attempt(), outcome.durationMillis()));
+            } else {
+                requestApproval(id, outcome.attempt(), artifact.ref(), approvalReasons);
+            }
         }
         schedule();
     }
 
     private void onErrored(Errored outcome) {
-        emit(seq -> new RunEvent.StageFailed(runId, seq, clock.instant(), outcome.stageId(), outcome.attempt(),
-                outcome.kind(), outcome.reason()));
+        if (!isCurrentAttempt(outcome.stageId(), outcome.attempt())) {
+            log.info("Discarding late failure of {} attempt {}", outcome.stageId(), outcome.attempt());
+            return;
+        }
+        endAttempt(outcome.stageId());
+        failAttempt(outcome.stageId(), outcome.attempt(), outcome.kind(), outcome.reason());
         schedule();
     }
 
-    /** Dispatches every stage whose dependencies are satisfied; completes the run when nothing is left. */
+    private void onTimeout(AttemptTimedOut timeout) {
+        String id = timeout.stageId();
+        if (!isCurrentAttempt(id, timeout.attempt())) {
+            return;
+        }
+        Future<?> worker = inflight.remove(id);
+        if (worker != null) {
+            worker.cancel(true); // interrupts the agent; its eventual outcome is discarded as stale
+        }
+        timers.remove("timeout:" + id);
+        failAttempt(id, timeout.attempt(), FailureKind.TIMEOUT, "attempt exceeded timeout of " + timeoutOf(definition.stage(id)));
+        schedule();
+    }
+
+    /** Bounded retry (OR-6) → single fallback attempt → terminal failure. */
+    private void failAttempt(String id, int attempt, FailureKind kind, String reason) {
+        StageDefinition stage = definition.stage(id);
+        RetryPolicy retry = stage.policy().retry();
+        Agent fallback = stage.policy().fallback();
+        boolean onFallback = state.fallbackActive(id);
+        boolean mayContinue = !state.stopRequested() && !state.anyStage(StageStatus.FAILED);
+
+        if (mayContinue && kind.retryable() && !onFallback && attempt < retry.maxAttempts()) {
+            Duration delay = retry.backoffAfter(attempt);
+            emit(seq -> new RunEvent.AttemptFailed(runId, seq, now(), id, attempt, kind, reason));
+            emit(seq -> new RunEvent.RetryScheduled(runId, seq, now(), id, attempt + 1, delay.toMillis()));
+            arm("retry:" + id, delay, new RetryDue(id));
+        } else if (mayContinue && fallback != null && !onFallback && kind != FailureKind.ENTRY_GATE) {
+            emit(seq -> new RunEvent.AttemptFailed(runId, seq, now(), id, attempt, kind, reason));
+            emit(seq -> new RunEvent.FallbackActivated(runId, seq, now(), id, fallback.name(),
+                    "primary agent failed after " + attempt + " attempt(s): " + reason));
+            dispatch(stage);
+        } else {
+            emit(seq -> new RunEvent.StageFailed(runId, seq, now(), id, attempt, kind, reason));
+        }
+    }
+
+    private void onRetryDue(String id) {
+        timers.remove("retry:" + id);
+        if (state.stageStatus(id) != StageStatus.WAITING_RETRY) {
+            return;
+        }
+        if (!state.stopRequested() && !state.anyStage(StageStatus.FAILED)) {
+            dispatch(definition.stage(id));
+        }
+        schedule();
+    }
+
+    // ---- approvals (OR-5, OR-14) ----
+
+    private void requestApproval(String stageId, int attempt, ArtifactRef artifact, List<String> reasons) {
+        String approvalId = UUID.randomUUID().toString();
+        Instant expiresAt = now().plus(settings.approvalTtl());
+        emit(seq -> new RunEvent.ApprovalRequested(runId, seq, now(), approvalId, stageId, attempt, artifact, reasons, expiresAt));
+        arm("approval:" + approvalId, settings.approvalTtl(), new ApprovalExpired(approvalId));
+    }
+
+    private void onApprovalCommand(ApprovalCommand cmd) {
+        Approval approval = state.approval(cmd.approvalId()).orElse(null);
+        if (approval == null) {
+            cmd.reply().completeExceptionally(new GovernanceException(Violation.APPROVAL_NOT_FOUND,
+                    "No approval '" + cmd.approvalId() + "' in run " + runId));
+            return;
+        }
+        if (approval.status() != ApprovalStatus.PENDING) {
+            cmd.reply().completeExceptionally(new GovernanceException(Violation.APPROVAL_NOT_PENDING,
+                    "Approval is already " + approval.status()));
+            return;
+        }
+        if (cmd.actor().equals(state.initiator())) {
+            cmd.reply().completeExceptionally(new GovernanceException(Violation.SELF_APPROVAL_FORBIDDEN,
+                    "'" + cmd.actor() + "' started this run and cannot approve its checkpoints"));
+            return;
+        }
+        if (!approval.artifact().contentHash().equals(cmd.artifactHash())) {
+            cmd.reply().completeExceptionally(new GovernanceException(Violation.STALE_APPROVAL,
+                    "Decision refers to artifact " + abbreviate(cmd.artifactHash()) + " but the pending artifact is "
+                            + approval.artifact() + "; review the current version"));
+            return;
+        }
+
+        cancelTimer("approval:" + approval.approvalId());
+        String stageId = approval.stageId();
+        if (cmd.approve()) {
+            emit(seq -> new RunEvent.ApprovalDecided(runId, seq, now(), approval.approvalId(), stageId,
+                    ApprovalStatus.APPROVED, cmd.actor(), cmd.comment()));
+            emit(seq -> new RunEvent.StageSucceeded(runId, seq, now(), stageId, approval.attempt(), 0));
+        } else {
+            emit(seq -> new RunEvent.ApprovalDecided(runId, seq, now(), approval.approvalId(), stageId,
+                    ApprovalStatus.REJECTED, cmd.actor(), cmd.comment()));
+            emit(seq -> new RunEvent.StageFailed(runId, seq, now(), stageId, approval.attempt(),
+                    FailureKind.APPROVAL_REJECTED, "rejected by " + cmd.actor()
+                            + (cmd.comment() == null || cmd.comment().isBlank() ? "" : ": " + cmd.comment())));
+        }
+        cmd.reply().complete(state.approval(approval.approvalId()).orElseThrow());
+        schedule();
+    }
+
+    private void onApprovalExpired(String approvalId) {
+        timers.remove("approval:" + approvalId);
+        Approval approval = state.approval(approvalId).orElse(null);
+        if (approval == null || approval.status() != ApprovalStatus.PENDING) {
+            return;
+        }
+        emit(seq -> new RunEvent.ApprovalDecided(runId, seq, now(), approvalId, approval.stageId(),
+                ApprovalStatus.EXPIRED, SYSTEM, "no decision before " + approval.expiresAt()));
+        emit(seq -> new RunEvent.StageFailed(runId, seq, now(), approval.stageId(), approval.attempt(),
+                FailureKind.APPROVAL_EXPIRED, "approval expired at " + approval.expiresAt()));
+        schedule();
+    }
+
+    // ---- safe-stop (OR-8) ----
+
+    private void onStop(StopCommand cmd) {
+        if (!state.stopRequested()) {
+            requestStop(cmd.actor(), cmd.reason());
+        }
+        cmd.reply().complete(null);
+        schedule();
+    }
+
+    private void requestStop(String actor, String reason) {
+        emit(seq -> new RunEvent.StopRequested(runId, seq, now(), actor, reason));
+    }
+
+    // ---- scheduling ----
+
+    /** Dispatches ready stages, winds down when failing/stopping, completes the run when idle. */
     private void schedule() {
-        if (state.status().isTerminal()) {
+        if (state.status().isTerminal() || compensating) {
+            return;
+        }
+        if (state.rollbackPlan().isPresent()) {
+            continueRollback();
             return;
         }
         for (String id : definition.topologicalOrder()) {
@@ -202,36 +433,228 @@ final class RunCoordinator {
             }
             String blocker = firstUnsuccessfulDependency(id);
             if (blocker != null) {
-                emit(seq -> new RunEvent.StageSkipped(runId, seq, clock.instant(), id,
-                        "upstream stage '" + blocker + "' did not succeed"));
-            } else if (!state.anyStage(StageStatus.FAILED) && allDependenciesSucceeded(id)) {
+                emit(seq -> new RunEvent.StageSkipped(runId, seq, now(), id, "upstream stage '" + blocker + "' did not succeed"));
+            } else if (!windingDown() && allDependenciesSucceeded(id)) {
                 dispatch(definition.stage(id));
             }
         }
-        if (!state.anyStage(StageStatus.RUNNING)) {
+        if (windingDown()) {
+            abandonWaitingWork();
+        }
+        if (!state.anyStageActive()) {
             finish();
         }
     }
 
+    private boolean windingDown() {
+        return state.stopRequested() || state.anyStage(StageStatus.FAILED);
+    }
+
+    /** Fail-fast / stop: queued retries and open approvals will never be acted on, so close them. */
+    private void abandonWaitingWork() {
+        String why = state.stopRequested() ? "run stopping" : "run failing";
+        for (String id : state.stagesWithStatus(StageStatus.WAITING_RETRY)) {
+            cancelTimer("retry:" + id);
+            emit(seq -> new RunEvent.StageSkipped(runId, seq, now(), id, "retry abandoned: " + why));
+        }
+        for (Approval approval : state.pendingApprovals()) {
+            cancelTimer("approval:" + approval.approvalId());
+            emit(seq -> new RunEvent.ApprovalDecided(runId, seq, now(), approval.approvalId(), approval.stageId(),
+                    ApprovalStatus.WITHDRAWN, SYSTEM, why));
+            emit(seq -> new RunEvent.StageSkipped(runId, seq, now(), approval.stageId(), "approval withdrawn: " + why));
+        }
+    }
+
     private void finish() {
-        if (state.anyStage(StageStatus.FAILED)) {
-            for (String id : definition.topologicalOrder()) {
-                if (state.stageStatus(id) == StageStatus.PENDING) {
-                    emit(seq -> new RunEvent.StageSkipped(runId, seq, clock.instant(), id,
-                            "run failed; no new stages are started after a failure"));
-                }
+        if (state.stopRequested()) {
+            skipPending("run stopped");
+            emit(seq -> new RunEvent.RunCompleted(runId, seq, now(), RunStatus.STOPPED, "safe-stop: " + state.stopReason()));
+        } else if (state.anyStage(StageStatus.FAILED)) {
+            skipPending("run failed; no new stages are started after a failure");
+            List<String> plan = new ArrayList<>(state.completionOrder().reversed().stream()
+                    .filter(id -> definition.stage(id).policy().compensation() != null).toList());
+            if (plan.isEmpty()) {
+                emit(seq -> new RunEvent.RunCompleted(runId, seq, now(), RunStatus.FAILED, failureSummary()));
+            } else {
+                emit(seq -> new RunEvent.RollbackStarted(runId, seq, now(), plan));
+                continueRollback();
             }
-            String failed = definition.topologicalOrder().stream()
-                    .filter(id -> state.stageStatus(id) == StageStatus.FAILED).toList().toString();
-            emit(seq -> new RunEvent.RunCompleted(runId, seq, clock.instant(), RunStatus.FAILED,
-                    "failed stages: " + failed));
         } else if (state.allStages(StageStatus.SUCCEEDED)) {
-            emit(seq -> new RunEvent.RunCompleted(runId, seq, clock.instant(), RunStatus.SUCCEEDED, "all stages succeeded"));
+            emit(seq -> new RunEvent.RunCompleted(runId, seq, now(), RunStatus.SUCCEEDED, "all stages succeeded"));
         } else {
             // Unreachable for a valid DAG; guards against a scheduling bug hanging the run.
-            emit(seq -> new RunEvent.RunCompleted(runId, seq, clock.instant(), RunStatus.FAILED,
+            emit(seq -> new RunEvent.RunCompleted(runId, seq, now(), RunStatus.FAILED,
                     "no runnable stages left (scheduler invariant violated)"));
         }
+    }
+
+    private void skipPending(String reason) {
+        for (String id : state.stagesWithStatus(StageStatus.PENDING)) {
+            emit(seq -> new RunEvent.StageSkipped(runId, seq, now(), id, reason));
+        }
+    }
+
+    // ---- rollback (OR-7) ----
+
+    /** Compensates one stage at a time, in plan order; idempotent across restarts. */
+    private void continueRollback() {
+        if (compensating) {
+            return;
+        }
+        String next = state.rollbackPlan().orElseThrow().stream()
+                .filter(id -> state.stageStatus(id) == StageStatus.SUCCEEDED)
+                .findFirst().orElse(null);
+        if (next == null) {
+            List<String> plan = state.rollbackPlan().orElseThrow();
+            long failedCompensations = plan.stream().filter(id -> state.stageStatus(id) == StageStatus.ROLLBACK_FAILED).count();
+            String reason = failureSummary() + "; rolled back " + (plan.size() - failedCompensations) + " stage(s)"
+                    + (failedCompensations > 0 ? "; " + failedCompensations + " compensation(s) failed, manual cleanup required" : "");
+            emit(seq -> new RunEvent.RunCompleted(runId, seq, now(), RunStatus.FAILED, reason));
+            return;
+        }
+        compensating = true;
+        var compensation = definition.stage(next).policy().compensation();
+        CompensationContext context = new CompensationContext(runId, next, state.latestArtifact(next));
+        agentExecutor.execute(() -> {
+            try {
+                post(new CompensationFinished(next, true, compensation.compensate(context)));
+            } catch (Throwable t) {
+                post(new CompensationFinished(next, false, "compensation failed: " + t));
+            }
+        });
+    }
+
+    private void onCompensationFinished(CompensationFinished done) {
+        compensating = false;
+        emit(seq -> new RunEvent.StageCompensated(runId, seq, now(), done.stageId(), done.succeeded(), done.detail()));
+        continueRollback();
+    }
+
+    // ---- dispatch ----
+
+    private void dispatch(StageDefinition stage) {
+        String id = stage.id();
+        int attempt = state.attempts(id) + 1;
+
+        // Entry gates use their own context so their reads never pollute the agent's lineage.
+        StageContext gateContext = contextFor(id, attempt);
+        List<String> failures = new ArrayList<>();
+        for (Gate gate : stage.entryGates()) {
+            GateResult result = evaluate(gate, new GateInput(gateContext, null));
+            emit(seq -> new RunEvent.GateEvaluated(runId, seq, now(), id, GateKind.ENTRY, gate.name(), result.passed(), result.reason()));
+            if (!result.passed()) {
+                failures.add(gate.name() + ": " + result.reason());
+            }
+        }
+        if (!failures.isEmpty()) {
+            emit(seq -> new RunEvent.StageFailed(runId, seq, now(), id, attempt, FailureKind.ENTRY_GATE, String.join("; ", failures)));
+            return;
+        }
+
+        Agent agent = state.fallbackActive(id) ? stage.policy().fallback() : stage.agent();
+        emit(seq -> new RunEvent.StageStarted(runId, seq, now(), id, attempt, agent.name()));
+        StageContext context = contextFor(id, attempt);
+        inflight.put(id, agentExecutor.submit(() -> {
+            try {
+                post(execute(stage, agent, context));
+            } catch (Throwable fatal) {
+                // Last resort (e.g. StackOverflowError): the coordinator must always hear back.
+                post(new Errored(id, attempt, FailureKind.AGENT_ERROR, "fatal: " + fatal, 0));
+                throw fatal;
+            }
+        }));
+        arm("timeout:" + id, timeoutOf(stage), new AttemptTimedOut(id, attempt));
+    }
+
+    private StageContext contextFor(String stageId, int attempt) {
+        Map<String, Artifact> visible = new HashMap<>();
+        for (String ancestor : definition.ancestorsOf(stageId)) {
+            Artifact artifact = state.latestArtifact(ancestor);
+            if (artifact != null) {
+                visible.put(ancestor, artifact);
+            }
+        }
+        return new StageContext(runId, stageId, attempt, state.requirement(), visible,
+                definition.ancestorsOf(stageId), clock, state::stopRequested);
+    }
+
+    // ------------------------------------------------------------------ worker threads
+
+    /** Runs on a virtual thread. Never throws: every path produces an outcome for the mailbox. */
+    private StageOutcome execute(StageDefinition stage, Agent agent, StageContext context) {
+        String id = stage.id();
+        int attempt = context.attempt();
+        MDC.put("runId", runId);
+        MDC.put("stageId", id);
+        long started = System.nanoTime();
+        try {
+            AgentResult result = agent.execute(context);
+            List<ArtifactRef> read = context.artifactsRead();
+            JsonNode output = mapper.valueToTree(result.output());
+            List<Decision> decisions = result.decisions().stream()
+                    .map(d -> new Decision(id, attempt, agent.name(), d.summary(), d.rationale(), read, clock.instant()))
+                    .toList();
+            List<GateCheck> gates = stage.exitGates().stream().map(gate -> {
+                GateResult r = evaluate(gate, new GateInput(context, output));
+                return new GateCheck(gate.name(), r.passed(), r.reason());
+            }).toList();
+            List<PolicyDecision> verdicts = policies.evaluate(new PolicyInput(definition.name(), id,
+                    context.requirement(), output, mapper.writeValueAsString(output)));
+            return new Completed(id, attempt, output, decisions, gates, verdicts, elapsedMillis(started));
+        } catch (ContextAccessException e) {
+            return new Errored(id, attempt, FailureKind.CONTEXT_VIOLATION, e.getMessage(), elapsedMillis(started));
+        } catch (Exception e) {
+            log.warn("Agent {} failed on stage {} attempt {}: {}", agent.name(), id, attempt, describe(e));
+            return new Errored(id, attempt, FailureKind.AGENT_ERROR, describe(e), elapsedMillis(started));
+        } finally {
+            MDC.remove("stageId");
+            MDC.remove("runId");
+        }
+    }
+
+    // ------------------------------------------------------------------ helpers
+
+    private boolean isCurrentAttempt(String stageId, int attempt) {
+        return state.stageStatus(stageId) == StageStatus.RUNNING && state.attempts(stageId) == attempt;
+    }
+
+    private void endAttempt(String stageId) {
+        inflight.remove(stageId);
+        cancelTimer("timeout:" + stageId);
+    }
+
+    private Duration timeoutOf(StageDefinition stage) {
+        return stage.policy().timeout() != null ? stage.policy().timeout() : settings.defaultStageTimeout();
+    }
+
+    private void arm(String key, Duration delay, Signal signal) {
+        cancelTimer(key);
+        long millis = Math.max(0, delay.toMillis());
+        timers.put(key, scheduler.schedule(() -> post(signal), millis, TimeUnit.MILLISECONDS));
+    }
+
+    private void cancelTimer(String key) {
+        ScheduledFuture<?> timer = timers.remove(key);
+        if (timer != null) {
+            timer.cancel(false);
+        }
+    }
+
+    /** After the run ends, commands still queued get a clear refusal instead of hanging their caller. */
+    private void rejectPendingCommands() {
+        Signal signal;
+        while ((signal = mailbox.poll()) != null) {
+            GovernanceException notActive = new GovernanceException(Violation.RUN_NOT_ACTIVE, "Run " + runId + " has finished");
+            if (signal instanceof ApprovalCommand a) {
+                a.reply().completeExceptionally(notActive);
+            } else if (signal instanceof StopCommand s) {
+                s.reply().completeExceptionally(notActive);
+            }
+        }
+    }
+
+    private String failureSummary() {
+        return "failed stages: " + state.stagesWithStatus(StageStatus.FAILED);
     }
 
     private String firstUnsuccessfulDependency(String id) {
@@ -248,84 +671,9 @@ final class RunCoordinator {
         return definition.stage(id).dependsOn().stream().allMatch(dep -> state.stageStatus(dep) == StageStatus.SUCCEEDED);
     }
 
-    private void dispatch(StageDefinition stage) {
-        String id = stage.id();
-        int attempt = state.attempts(id) + 1;
-
-        // Entry gates see the same inputs the agent will, but through their own context so that
-        // reads made by gates never pollute the agent's decision lineage.
-        StageContext gateContext = contextFor(id, attempt);
-        List<String> failures = new ArrayList<>();
-        for (Gate gate : stage.entryGates()) {
-            GateResult result = evaluate(gate, new GateInput(gateContext, null));
-            emit(seq -> new RunEvent.GateEvaluated(runId, seq, clock.instant(), id, GateKind.ENTRY,
-                    gate.name(), result.passed(), result.reason()));
-            if (!result.passed()) {
-                failures.add(gate.name() + ": " + result.reason());
-            }
-        }
-        if (!failures.isEmpty()) {
-            emit(seq -> new RunEvent.StageFailed(runId, seq, clock.instant(), id, attempt,
-                    FailureKind.ENTRY_GATE, String.join("; ", failures)));
-            return;
-        }
-
-        emit(seq -> new RunEvent.StageStarted(runId, seq, clock.instant(), id, attempt, stage.agent().name()));
-        StageContext context = contextFor(id, attempt);
-        agentExecutor.execute(() -> {
-            try {
-                mailbox.add(execute(stage, context));
-            } catch (Throwable fatal) {
-                // Last resort (e.g. StackOverflowError in an agent): the coordinator must always
-                // hear back, or the run would wait forever on a stage that silently died.
-                mailbox.add(new Errored(id, attempt, FailureKind.AGENT_ERROR, "fatal: " + fatal, 0));
-                throw fatal;
-            }
-        });
-    }
-
-    private StageContext contextFor(String stageId, int attempt) {
-        Map<String, Artifact> visible = new HashMap<>();
-        for (String ancestor : definition.ancestorsOf(stageId)) {
-            Artifact artifact = state.latestArtifact(ancestor);
-            if (artifact != null) {
-                visible.put(ancestor, artifact);
-            }
-        }
-        return new StageContext(runId, stageId, attempt, state.requirement(), visible,
-                definition.ancestorsOf(stageId), clock, () -> false);
-    }
-
-    // ------------------------------------------------------------------ worker threads
-
-    /** Runs on a virtual thread. Never throws: every path produces an outcome for the mailbox. */
-    private StageOutcome execute(StageDefinition stage, StageContext context) {
-        String id = stage.id();
-        int attempt = context.attempt();
-        MDC.put("runId", runId);
-        MDC.put("stageId", id);
-        long started = System.nanoTime();
-        try {
-            AgentResult result = stage.agent().execute(context);
-            List<ArtifactRef> read = context.artifactsRead();
-            JsonNode output = mapper.valueToTree(result.output());
-            List<Decision> decisions = result.decisions().stream()
-                    .map(d -> new Decision(id, attempt, stage.agent().name(), d.summary(), d.rationale(), read, clock.instant()))
-                    .toList();
-            List<GateCheck> gates = stage.exitGates().stream().map(gate -> {
-                GateResult r = evaluate(gate, new GateInput(context, output));
-                return new GateCheck(gate.name(), r.passed(), r.reason());
-            }).toList();
-            return new Completed(id, attempt, output, decisions, gates, elapsedMillis(started));
-        } catch (ContextAccessException e) {
-            return new Errored(id, attempt, FailureKind.CONTEXT_VIOLATION, e.getMessage(), elapsedMillis(started));
-        } catch (Exception e) {
-            log.warn("Agent {} failed on stage {} attempt {}", stage.agent().name(), id, attempt, e);
-            return new Errored(id, attempt, FailureKind.AGENT_ERROR, describe(e), elapsedMillis(started));
-        } finally {
-            MDC.remove("stageId");
-            MDC.remove("runId");
-        }
+    private static String summarize(List<PolicyDecision> decisions, PolicyOutcome outcome) {
+        return String.join("; ", decisions.stream().filter(p -> p.outcome() == outcome)
+                .map(p -> p.category() + "/" + p.policy() + ": " + p.reason()).toList());
     }
 
     /** Gates fail closed: an exception or a null result counts as a failed gate. */
@@ -338,12 +686,20 @@ final class RunCoordinator {
         }
     }
 
-    private static String describe(Exception e) {
+    private static String describe(Throwable e) {
         return e.getClass().getSimpleName() + (e.getMessage() != null ? ": " + e.getMessage() : "");
+    }
+
+    private static String abbreviate(String hash) {
+        return hash == null ? "(none)" : hash.substring(0, Math.min(12, hash.length()));
     }
 
     private static long elapsedMillis(long startedNanos) {
         return (System.nanoTime() - startedNanos) / 1_000_000;
+    }
+
+    private Instant now() {
+        return clock.instant();
     }
 
     /** Append to the log first, then apply: state is never ahead of the durable record. */

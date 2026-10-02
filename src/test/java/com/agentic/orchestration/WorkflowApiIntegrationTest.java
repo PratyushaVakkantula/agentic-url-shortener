@@ -57,6 +57,24 @@ class WorkflowApiIntegrationTest {
                     .stage("plan", echo).dependsOn("understand").entryGate(Gates.upstreamHas("understand", "title")).add()
                     .build();
         }
+
+        @Bean
+        WorkflowDefinition gatedWorkflow() {
+            Agent releaser = new Agent() {
+                @Override
+                public String name() {
+                    return "releaser";
+                }
+
+                @Override
+                public AgentResult execute(StageContext ctx) {
+                    return AgentResult.of(Map.of("version", "1.0.0"));
+                }
+            };
+            return WorkflowDefinition.builder("gated", 1)
+                    .stage("release", releaser).requiresApproval("production release").add()
+                    .build();
+        }
     }
 
     @Autowired
@@ -134,6 +152,88 @@ class WorkflowApiIntegrationTest {
         mvc.perform(get("/api/v1/runs/00000000-0000-0000-0000-000000000000").with(httpBasic("alice", "alice-pass")))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.errorCode").value("RUN_NOT_FOUND"));
+    }
+
+    @Test
+    void approvalFlowEnforcesSeparationOfDutiesAndArtifactBinding() throws Exception {
+        String runId = mapper.readTree(mvc.perform(post("/api/v1/workflows/gated/runs").with(httpBasic("alice", "alice-pass"))
+                        .contentType(MediaType.APPLICATION_JSON).content(BODY))
+                .andReturn().getResponse().getContentAsString()).get("runId").asString();
+        var approval = awaitPendingApproval(runId);
+        String approvalId = approval.get("approvalId").asString();
+        String hash = approval.get("artifact").get("contentHash").asString();
+        String url = "/api/v1/runs/" + runId + "/approvals/" + approvalId;
+
+        mvc.perform(post(url).with(httpBasic("alice", "alice-pass")).contentType(MediaType.APPLICATION_JSON)
+                        .content(decision("APPROVE", hash)))
+                .andExpect(status().isForbidden()); // alice is not an APPROVER (role check)
+        mvc.perform(post(url).with(httpBasic("admin", "admin-pass")).contentType(MediaType.APPLICATION_JSON)
+                        .content(decision("APPROVE", "a".repeat(64))))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("STALE_APPROVAL"));
+        mvc.perform(post(url).with(httpBasic("bob", "bob-pass")).contentType(MediaType.APPLICATION_JSON)
+                        .content(decision("APPROVE", hash)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("APPROVED"))
+                .andExpect(jsonPath("$.decidedBy").value("bob"));
+
+        assertThatRunSucceeds(runId);
+        mvc.perform(post(url).with(httpBasic("carol", "carol-pass")).contentType(MediaType.APPLICATION_JSON)
+                        .content(decision("APPROVE", hash)))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("RUN_NOT_ACTIVE"));
+    }
+
+    @Test
+    void initiatorWithApproverRoleStillCannotSelfApprove() throws Exception {
+        // admin holds every role via the hierarchy, so only separation of duties stops this.
+        String runId = mapper.readTree(mvc.perform(post("/api/v1/workflows/gated/runs").with(httpBasic("admin", "admin-pass"))
+                        .contentType(MediaType.APPLICATION_JSON).content(BODY))
+                .andReturn().getResponse().getContentAsString()).get("runId").asString();
+        var approval = awaitPendingApproval(runId);
+
+        mvc.perform(post("/api/v1/runs/" + runId + "/approvals/" + approval.get("approvalId").asString())
+                        .with(httpBasic("admin", "admin-pass")).contentType(MediaType.APPLICATION_JSON)
+                        .content(decision("APPROVE", approval.get("artifact").get("contentHash").asString())))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.errorCode").value("SELF_APPROVAL_FORBIDDEN"));
+    }
+
+    @Test
+    void safeStopIsAdminOnly() throws Exception {
+        String runId = mapper.readTree(mvc.perform(post("/api/v1/workflows/gated/runs").with(httpBasic("alice", "alice-pass"))
+                        .contentType(MediaType.APPLICATION_JSON).content(BODY))
+                .andReturn().getResponse().getContentAsString()).get("runId").asString();
+        awaitPendingApproval(runId);
+        String stop = "{\"reason\": \"scope changed\"}";
+
+        mvc.perform(post("/api/v1/runs/" + runId + "/stop").with(httpBasic("bob", "bob-pass"))
+                        .contentType(MediaType.APPLICATION_JSON).content(stop))
+                .andExpect(status().isForbidden());
+        mvc.perform(post("/api/v1/runs/" + runId + "/stop").with(httpBasic("admin", "admin-pass"))
+                        .contentType(MediaType.APPLICATION_JSON).content(stop))
+                .andExpect(status().isAccepted());
+
+        org.assertj.core.api.Assertions.assertThat(engine.awaitCompletion(runId, Duration.ofSeconds(10)).status())
+                .isEqualTo(RunStatus.STOPPED);
+    }
+
+    private static String decision(String decision, String hash) {
+        return "{\"decision\": \"%s\", \"artifactHash\": \"%s\", \"comment\": \"ok\"}".formatted(decision, hash);
+    }
+
+    private tools.jackson.databind.JsonNode awaitPendingApproval(String runId) throws Exception {
+        for (int i = 0; i < 200; i++) {
+            var view = mapper.readTree(mvc.perform(get("/api/v1/runs/" + runId).with(httpBasic("carol", "carol-pass")))
+                    .andReturn().getResponse().getContentAsString());
+            for (var approval : view.get("approvals")) {
+                if ("PENDING".equals(approval.get("status").asString())) {
+                    return approval;
+                }
+            }
+            Thread.sleep(10);
+        }
+        throw new AssertionError("no pending approval for run " + runId);
     }
 
     private void assertThatRunSucceeds(String runId) throws Exception {

@@ -4,6 +4,7 @@ import com.agentic.orchestration.engine.WorkflowCatalog;
 import com.agentic.orchestration.engine.WorkflowEngine;
 import com.agentic.orchestration.engine.UnknownWorkflowException;
 import com.agentic.orchestration.event.RunSummary;
+import com.agentic.orchestration.model.Approval;
 import com.agentic.orchestration.model.Requirement;
 import com.agentic.orchestration.state.RunView;
 import io.swagger.v3.oas.annotations.Operation;
@@ -69,6 +70,26 @@ public class WorkflowController {
     @Operation(summary = "Current state of a run: stages, gates, artifacts, decisions")
     public RunView run(@PathVariable String runId) {
         return engine.get(runId);
+    }
+
+    @PostMapping("/runs/{runId}/approvals/{approvalId}")
+    @PreAuthorize("hasRole('APPROVER')")
+    @Operation(summary = "Approve or reject a checkpoint (APPROVER, never the run's initiator)",
+            description = "artifactHash must equal the pending artifact's hash. Errors: 403 self-approval, "
+                    + "409 stale hash or already decided, 404 unknown approval.")
+    public Approval decide(@PathVariable String runId, @PathVariable String approvalId,
+                           @Valid @RequestBody ApprovalDecisionRequest request, Principal principal) {
+        return engine.decide(runId, approvalId, request.decision() == ApprovalDecisionRequest.Decision.APPROVE,
+                principal.getName(), request.artifactHash(), request.comment());
+    }
+
+    @PostMapping("/runs/{runId}/stop")
+    @PreAuthorize("hasRole('ADMIN')")
+    @Operation(summary = "Safe-stop a run (ADMIN)",
+            description = "No new stages start, in-flight stages finish, open approvals are withdrawn; ends STOPPED. Idempotent.")
+    public ResponseEntity<Void> stop(@PathVariable String runId, @Valid @RequestBody StopRunRequest request, Principal principal) {
+        engine.requestStop(runId, principal.getName(), request.reason());
+        return ResponseEntity.accepted().build();
     }
 
     @GetMapping("/runs/{runId}/events")

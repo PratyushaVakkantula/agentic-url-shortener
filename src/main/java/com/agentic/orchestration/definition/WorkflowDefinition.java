@@ -1,6 +1,7 @@
 package com.agentic.orchestration.definition;
 
 import com.agentic.orchestration.agent.Agent;
+import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -226,6 +227,7 @@ public final class WorkflowDefinition {
         private final Set<String> dependsOn = new LinkedHashSet<>();
         private final List<Gate> entryGates = new ArrayList<>();
         private final List<Gate> exitGates = new ArrayList<>();
+        private StagePolicy policy = StagePolicy.DEFAULT;
 
         private StageBuilder(Builder parent, String id, Agent agent) {
             this.parent = parent;
@@ -253,9 +255,35 @@ public final class WorkflowDefinition {
             return this;
         }
 
+        public StageBuilder retry(int maxAttempts, Duration initialBackoff) {
+            policy = policy.withRetry(RetryPolicy.of(maxAttempts, initialBackoff));
+            return this;
+        }
+
+        public StageBuilder timeout(Duration timeout) {
+            policy = policy.withTimeout(timeout);
+            return this;
+        }
+
+        public StageBuilder fallback(Agent fallback) {
+            policy = policy.withFallback(fallback);
+            return this;
+        }
+
+        public StageBuilder compensation(Compensation compensation) {
+            policy = policy.withCompensation(compensation);
+            return this;
+        }
+
+        /** Marks the stage high-impact: its output always needs human approval. */
+        public StageBuilder requiresApproval(String reason) {
+            policy = policy.withApproval(reason);
+            return this;
+        }
+
         /** Finishes this stage and continues with the workflow builder. */
         public Builder add() {
-            return parent.add(new StageDefinition(id, description, agent, dependsOn, entryGates, exitGates));
+            return parent.add(new StageDefinition(id, description, agent, dependsOn, entryGates, exitGates, policy));
         }
     }
 }

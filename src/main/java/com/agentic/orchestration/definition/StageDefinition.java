@@ -16,6 +16,7 @@ import java.util.regex.Pattern;
  *                   impacted modules"); a failure means the stage cannot start
  * @param exitGates  checks on the agent's output (e.g. "tests reported zero failures"); a failure
  *                   counts as a failed attempt
+ * @param policy     retry, timeout, fallback, compensation and approval settings
  */
 public record StageDefinition(
         String id,
@@ -23,7 +24,8 @@ public record StageDefinition(
         Agent agent,
         Set<String> dependsOn,
         List<Gate> entryGates,
-        List<Gate> exitGates) {
+        List<Gate> exitGates,
+        StagePolicy policy) {
 
     private static final Pattern ID = Pattern.compile("[a-z][a-z0-9-]{0,40}");
 
@@ -37,5 +39,6 @@ public record StageDefinition(
         dependsOn = Set.copyOf(dependsOn);
         entryGates = List.copyOf(entryGates);
         exitGates = List.copyOf(exitGates);
+        policy = policy == null ? StagePolicy.DEFAULT : policy;
     }
 }

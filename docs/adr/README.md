@@ -13,3 +13,4 @@ decision gets a new ADR that supersedes the old one.
 | [0004](0004-redirect-hot-path.md) | Redirect hot path: read-through cache and asynchronous click recording | Accepted |
 | [0005](0005-orchestration-engine-actor-event-sourced.md) | Orchestration engine: one actor per run, event-sourced state | Accepted |
 | [0006](0006-durable-event-store-and-recovery.md) | Durable event store and crash recovery | Accepted |
+| [0007](0007-governance-controls.md) | Governance: approvals, policies, retries, rollback, safe-stop | Accepted |
