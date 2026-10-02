@@ -24,6 +24,7 @@ import com.agentic.orchestration.model.StageStatus;
 import com.agentic.orchestration.state.RunState;
 import com.agentic.orchestration.state.RunView;
 import java.time.Clock;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -78,6 +79,7 @@ final class RunCoordinator {
     private final RunState state = new RunState();
     private final BlockingQueue<Signal> mailbox = new LinkedBlockingQueue<>();
     private final CompletableFuture<RunView> completion = new CompletableFuture<>();
+    private volatile Thread thread;
 
     RunCoordinator(String runId, WorkflowDefinition definition, RunEventStore store, ExecutorService agentExecutor,
                    JsonMapper mapper, Clock clock) {
@@ -94,7 +96,31 @@ final class RunCoordinator {
         emit(seq -> new RunEvent.RunStarted(runId, seq, clock.instant(), definition.name(), definition.version(),
                 requirement, initiator, definition.topologicalOrder()));
         mailbox.add(new Schedule());
-        Thread.ofVirtual().name("run-" + runId).start(this::loop);
+        thread = Thread.ofVirtual().name("run-" + runId).start(this::loop);
+    }
+
+    /**
+     * Continues a run from its persisted history after a restart (OR-15): rebuild state by
+     * replay, record which stages were interrupted, then schedule as usual.
+     */
+    void resume(List<RunEvent> history) {
+        history.forEach(state::apply);
+        List<String> interrupted = state.stagesWithStatus(StageStatus.RUNNING);
+        emit(seq -> new RunEvent.RunResumed(runId, seq, clock.instant(), interrupted));
+        mailbox.add(new Schedule());
+        thread = Thread.ofVirtual().name("run-" + runId).start(this::loop);
+    }
+
+    /**
+     * Stops the coordinator <b>without writing anything</b>, exactly as if the process died.
+     * Shutdown and crash therefore leave the same durable state, and recovery is one tested path.
+     */
+    void stop() throws InterruptedException {
+        Thread t = thread;
+        if (t != null) {
+            t.interrupt();
+            t.join(Duration.ofSeconds(5));
+        }
     }
 
     RunView view() {
@@ -116,8 +142,9 @@ final class RunCoordinator {
             }
             completion.complete(state.view());
         } catch (InterruptedException e) {
+            // Shutdown: leave the run as RUNNING in the store; it is resumed on next start.
             Thread.currentThread().interrupt();
-            completion.completeExceptionally(e);
+            completion.completeExceptionally(new IllegalStateException("engine stopped; run " + runId + " will resume on restart"));
         } catch (RuntimeException e) {
             // A coordinator bug must not leave callers waiting forever.
             log.error("Coordinator for run {} crashed", runId, e);

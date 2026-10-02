@@ -6,6 +6,7 @@ import com.agentic.orchestration.event.RunEvent.ArtifactProduced;
 import com.agentic.orchestration.event.RunEvent.DecisionRecorded;
 import com.agentic.orchestration.event.RunEvent.GateEvaluated;
 import com.agentic.orchestration.event.RunEvent.RunCompleted;
+import com.agentic.orchestration.event.RunEvent.RunResumed;
 import com.agentic.orchestration.event.RunEvent.RunStarted;
 import com.agentic.orchestration.event.RunEvent.StageFailed;
 import com.agentic.orchestration.event.RunEvent.StageSkipped;
@@ -106,6 +107,11 @@ public final class RunState {
                 s.finishedAt = e.at();
                 s.lastFailure = e.reason();
             }
+            case RunResumed e -> e.interruptedStages().forEach(id -> {
+                StageState s = stage(id);
+                s.status = StageStatus.PENDING;
+                s.lastFailure = "interrupted by restart during attempt " + s.attempts;
+            });
             case RunCompleted e -> {
                 status = e.status();
                 statusReason = e.reason();
@@ -154,6 +160,18 @@ public final class RunState {
 
     public synchronized boolean anyStage(StageStatus status) {
         return stages.values().stream().anyMatch(s -> s.status == status);
+    }
+
+    public synchronized List<String> stagesWithStatus(StageStatus status) {
+        return stages.entrySet().stream().filter(e -> e.getValue().status == status).map(Map.Entry::getKey).toList();
+    }
+
+    public synchronized String workflow() {
+        return workflow;
+    }
+
+    public synchronized int workflowVersion() {
+        return workflowVersion;
     }
 
     public synchronized boolean allStages(StageStatus status) {

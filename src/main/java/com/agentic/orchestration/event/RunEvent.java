@@ -52,6 +52,14 @@ public sealed interface RunEvent {
     record StageSkipped(String runId, long seq, Instant at, String stageId, String reason) implements RunEvent {
     }
 
+    /**
+     * The process restarted while the run was in flight. Stages that were RUNNING lost their
+     * worker and go back to PENDING; they are re-dispatched as a new attempt. Safe because agents
+     * only produce proposals (no external side effects), so re-execution is idempotent.
+     */
+    record RunResumed(String runId, long seq, Instant at, List<String> interruptedStages) implements RunEvent {
+    }
+
     record RunCompleted(String runId, long seq, Instant at, RunStatus status, String reason) implements RunEvent {
     }
 }

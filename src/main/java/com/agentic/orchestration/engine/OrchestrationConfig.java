@@ -1,16 +1,42 @@
 package com.agentic.orchestration.engine;
 
-import com.agentic.orchestration.event.InMemoryRunEventStore;
+import com.agentic.orchestration.event.JdbcRunEventStore;
+import com.agentic.orchestration.event.RunEventCodec;
 import com.agentic.orchestration.event.RunEventStore;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.event.EventListener;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
+import tools.jackson.databind.json.JsonMapper;
 
 @Configuration
 public class OrchestrationConfig {
 
-    /** Replaced by a durable, database-backed store in the next step. */
     @Bean
-    RunEventStore runEventStore() {
-        return new InMemoryRunEventStore();
+    RunEventStore runEventStore(JdbcClient jdbc, PlatformTransactionManager txManager, JsonMapper mapper) {
+        return new JdbcRunEventStore(jdbc, new TransactionTemplate(txManager), new RunEventCodec(mapper));
+    }
+
+    /** Resume interrupted runs once the app (and Flyway) is fully up. */
+    @Bean
+    RecoveryOnStartup recoveryOnStartup(WorkflowEngine engine) {
+        return new RecoveryOnStartup(engine);
+    }
+
+    static final class RecoveryOnStartup {
+
+        private final WorkflowEngine engine;
+
+        RecoveryOnStartup(WorkflowEngine engine) {
+            this.engine = engine;
+        }
+
+        @EventListener(ApplicationReadyEvent.class)
+        void resume() {
+            engine.resumeUnfinishedRuns();
+        }
     }
 }

@@ -38,7 +38,7 @@ class WorkflowEngineTest {
     private static final Requirement REQ = new Requirement("Add expiry to links", "Links should expire.");
 
     private final InMemoryRunEventStore store = new InMemoryRunEventStore();
-    private final WorkflowEngine engine = new WorkflowEngine(store, JsonMapper.builder().build(), Clock.systemUTC());
+    private final WorkflowEngine engine = new WorkflowEngine(store, new WorkflowCatalog(List.of()), JsonMapper.builder().build(), Clock.systemUTC());
 
     @AfterEach
     void shutdown() {
