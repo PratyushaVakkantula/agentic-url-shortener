@@ -6,10 +6,16 @@
 #   ./scripts/demo.sh            # all sections
 #   ./scripts/demo.sh brownfield # one section: shortener | greenfield | brownfield | ambiguous | governance | metrics
 #
+# Crash-recovery demo (see README):
+#   ./scripts/demo.sh pause          # start a run and leave it waiting at a human checkpoint; prints the run id
+#   kill -9 <server pid>; ./mvnw spring-boot:run
+#   ./scripts/demo.sh approve <id>   # approve its checkpoints on the restarted server and finish the run
+#
 set -euo pipefail
 
 BASE="${BASE:-http://localhost:8080}"
 SECTION="${1:-all}"
+RUN_ARG="${2:-}"
 
 bold() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 step() { printf '  \033[36m▸\033[0m %s\n' "$*"; }
@@ -184,10 +190,41 @@ section_metrics() {
       governance: .governance, replanning: .replanning}' | sed 's/^/    /'
 }
 
+section_pause() {
+  bold "Crash-recovery demo, part 1: leave a run waiting for a human"
+  local id; id=$(start_run brownfield-change "Add per-link click limits" \
+    "Each short link can have an optional maximum number of clicks. Once the limit is reached, the link must return 410 Gone.")
+  local a; a=$(await_approval "$id" "*")
+  step "run $id is waiting at '$(jq -r .stageId <<<"$a")' (approval $(jq -r '.approvalId[0:8]' <<<"$a"))"
+  step "now crash the server:   pkill -9 -f AgenticUrlShortenerApplication"
+  step "start it again:         ./mvnw spring-boot:run   (log shows: Resumed run ${id:0:8}…)"
+  step "then finish the run:    ./scripts/demo.sh approve $id"
+}
+
+section_approve() {
+  [[ -z "$RUN_ARG" ]] && { echo "usage: $0 approve <runId>" >&2; exit 2; }
+  bold "Crash-recovery demo, part 2: decide the open checkpoint(s) on the restarted server"
+  step "run status after restart: $(run "$RUN_ARG" | jq -r .status)"
+  # Approve whatever checkpoint is open until the run ends (it may raise more than one).
+  for _ in $(seq 1 600); do
+    local view; view=$(run "$RUN_ARG")
+    [[ "$(jq -r .status <<<"$view")" != "RUNNING" ]] && break
+    local a; a=$(jq -c '[.approvals[] | select(.status=="PENDING")][0] // empty' <<<"$view")
+    if [[ -n "$a" ]]; then
+      step "approving '$(jq -r .stageId <<<"$a")' (approval $(jq -r '.approvalId[0:8]' <<<"$a"))"
+      approve "$RUN_ARG" "$a"
+    fi
+    sleep 0.1
+  done
+  step "finished: $(await_end "$RUN_ARG")"
+  summary "$RUN_ARG"
+  step "audit trail includes RunResumed: $(api bob GET "/api/v1/runs/$RUN_ARG/events" | jq '[.[].type] | index("RunResumed") != null')"
+}
+
 curl -sf "$BASE/actuator/health" >/dev/null || { echo "No app at $BASE — start it with ./mvnw spring-boot:run" >&2; exit 1; }
 case "$SECTION" in
   all) section_shortener; section_greenfield; section_brownfield; section_ambiguous; section_governance; section_metrics ;;
-  shortener|greenfield|brownfield|ambiguous|governance|metrics) "section_$SECTION" ;;
+  shortener|greenfield|brownfield|ambiguous|governance|metrics|pause|approve) "section_$SECTION" ;;
   *) echo "unknown section '$SECTION'" >&2; exit 2 ;;
 esac
 bold "Done. Swagger UI: $BASE/swagger-ui.html"

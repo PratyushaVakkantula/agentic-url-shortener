@@ -39,26 +39,50 @@ when its inputs change.
 
 ## Quick start
 
-Prerequisites: **JDK 21**. For the demo script you also need `curl` and `jq`. Maven is not
-needed, because the wrapper downloads it.
+### 1. Prerequisites
+
+| Need | Check | Install if missing |
+|---|---|---|
+| **JDK 21** (the version it is built and tested with) | `java -version` → `21…` | macOS: `brew install openjdk@21`, then `export JAVA_HOME=/opt/homebrew/opt/openjdk@21`; any OS: [Adoptium Temurin 21](https://adoptium.net) or `sdk install java 21-tem` ([SDKMAN](https://sdkman.io)) |
+| `curl` and `jq` (demo script only) | `jq --version` | macOS 15+ ships both; otherwise `brew install jq` / `apt install jq` |
+| Free port 8080 | – | or pick another port (see Troubleshooting) |
+
+Maven is **not** needed: `./mvnw` downloads the right version on first use (needs internet once).
+On **Windows** use `mvnw.cmd` instead of `./mvnw`, and run the demo script from Git Bash or WSL.
+
+### 2. Build and test
 
 ```bash
 ./mvnw verify
 ```
-Builds the project, runs all 247 tests and the ArchUnit rules, and writes a coverage report to `target/site/jacoco/index.html`.
+Compiles, runs all 247 tests and the architecture rules, and writes a coverage report to
+`target/site/jacoco/index.html`. The first run downloads dependencies, which takes a few minutes; after that a full build takes
+under a minute (about 25 s measured).
+
+### 3. Run the app
 
 ```bash
 ./mvnw spring-boot:run
 ```
-Starts the app on http://localhost:8080. Swagger UI is at `/swagger-ui.html`.
+Ready when the log shows `Started AgenticUrlShortenerApplication`. Then:
+- Swagger UI: http://localhost:8080/swagger-ui.html (use **Authorize** with a demo user below)
+- Health: http://localhost:8080/actuator/health
+
+Data is stored in `./data/` (H2 file database), so it survives restarts. Stop the app with `Ctrl+C`.
+
+### 4. Run the end-to-end demo
+
+In a **second terminal**, with the app running:
 
 ```bash
 ./scripts/demo.sh
 ```
-In a second terminal, runs the end-to-end demo: all three scenarios, the governance refusals, and the metrics.
+Runs everything through the public HTTP API: the shortener, the three scenarios (greenfield,
+brownfield, ambiguous with a human revision), the governance refusals, and the metrics. It takes
+about 5 seconds, and it is safe to run repeatedly.
 
-Run one section with `./scripts/demo.sh brownfield`. Available sections are `shortener`,
-`greenfield`, `brownfield`, `ambiguous`, `governance` and `metrics`.
+Run a single section by passing its name, for example `./scripts/demo.sh brownfield`. Sections:
+`shortener`, `greenfield`, `brownfield`, `ambiguous`, `governance`, `metrics`.
 
 ### Demo users
 
@@ -70,13 +94,35 @@ Run one section with `./scripts/demo.sh brownfield`. Available sections are `sho
 
 Passwords are stored as bcrypt hashes. Anonymous users can create and follow short links.
 
-### Try the crash recovery yourself
+### Crash-recovery demo (about 1 minute)
 
-1. Start a brownfield run (`./scripts/demo.sh brownfield`) and stop the script at the first
-   checkpoint, or start one with `curl`.
-2. Kill the server with `kill -9 <pid>`.
-3. Start it again with `./mvnw spring-boot:run`. The log shows `Resumed run … (brownfield-change v1)`.
-4. `GET /api/v1/runs/{id}` shows the same pending approval. Approve it and the run completes.
+Shows a run surviving a hard kill while it waits for a human.
+
+1. Start a run and leave it waiting at a checkpoint (the script prints the run id):
+   ```bash
+   ./scripts/demo.sh pause
+   ```
+2. Crash the server:
+   ```bash
+   pkill -9 -f AgenticUrlShortenerApplication
+   ```
+3. Start it again with `./mvnw spring-boot:run`. The log shows `Resumed run <id> (brownfield-change v1)`.
+4. Decide the **same** open approval on the new process, and finish the run:
+   ```bash
+   ./scripts/demo.sh approve <run-id-from-step-1>
+   ```
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `Unable to locate a Java Runtime` (macOS), `java: command not found`, or a `JAVA_HOME` error | No JDK found | Install JDK 21 (see Prerequisites); check with `java -version` |
+| `release version 21 not supported` | An older JDK is active | Point `JAVA_HOME` at JDK 21 |
+| `Port 8080 was already in use` | Something else uses 8080 | `SERVER_PORT=8081 ./mvnw spring-boot:run`, then `BASE=http://localhost:8081 ./scripts/demo.sh` |
+| `Database may be already in use` | A second copy of the app is running against `./data` | Stop the other copy (only one instance per database) |
+| Demo prints `No app at http://localhost:8080` | App not started yet | Start it and wait for `Started AgenticUrlShortenerApplication` |
+| `jq: command not found` | Demo dependency missing | Install `jq` |
+| Want a clean slate | – | Stop the app and delete `./data/` |
 
 ## API at a glance
 
@@ -127,7 +173,7 @@ src/main/java/com/agentic/
     ├── workflows/   greenfield / brownfield / ambiguous definitions
     └── api/         REST controllers
 src/main/resources/db/migration/   V1–V4 (append-only)
-scripts/demo.sh                    end-to-end demo against a running instance
+scripts/demo.sh                    end-to-end demo (and crash-recovery demo) against a running instance
 ```
 
 ## Configuration
