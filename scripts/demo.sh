@@ -4,7 +4,7 @@
 # Requires curl and jq. Every step goes through the public HTTP API, exactly as a client would.
 #
 #   ./scripts/demo.sh            # all sections
-#   ./scripts/demo.sh brownfield # one section: shortener | greenfield | brownfield | ambiguous | governance | metrics
+#   ./scripts/demo.sh brownfield # one section: shortener | greenfield | brownfield | bugfix | ambiguous | governance | metrics
 #
 # Crash-recovery demo (see README):
 #   ./scripts/demo.sh pause          # start a run and leave it waiting at a human checkpoint; prints the run id
@@ -125,13 +125,31 @@ section_brownfield() {
   step "impact analysis:"
   run "$id" | jq -r '.artifacts[] | select(.stageId=="impact-analysis") | .content |
       "      module \(.primaryModules), tables \(.tables), next migration \(.nextMigration), risk \(.riskLevel)",
-      "      seeds \([.seeds[].type])", "      scanned \(.stats.typesScanned) types / \(.stats.dependencyEdges) edges"'
+      "      seeds \([.seeds[].type])", "      scanned \(.stats.typesScanned) types / \(.stats.dependencyEdges) edges",
+      "      data flows (\(.dataFlows | length)), entry → … → table:",
+      (.dataFlows[] | "        \(.path | join(" → ")) → \(.table)")'
   step "design: $(run "$id" | jq -r '.artifacts[] | select(.stageId=="design") | .content.schemaChanges[0].statement')"
   step "checkpoint at 'implementation' — reasons:"; jq -r '.reasons[] | "      • " + .' <<<"$first"
   approve "$id" "$first"; show "approved by bob"
   checkpoint "$id" release
   step "finished: $(await_end "$id")"
   summary "$id"
+}
+
+section_bugfix() {
+  bold "3b. Brownfield bug fix: a real defect in this codebase, handled as a targeted patch"
+  local id; id=$(start_run brownfield-change "Fix: one invalid click loses the whole analytics batch" \
+    "Clicks are written in batches. When a single click in a batch cannot be stored, every click in that batch is lost. Valid clicks must still be recorded when one click in the batch is invalid. The invalid click must be counted as failed.")
+  step "run $id started"
+  local a; a=$(await_approval "$id" "*")
+  run "$id" | jq -r '
+    (.artifacts[] | select(.stageId=="requirements") | .content | "  ▸ classified as \(.changeType)"),
+    (.artifacts[] | select(.stageId=="impact-analysis") | .content | "  ▸ impact: seeds \([.seeds[].type][0:2]), flow \(first(.dataFlows[] | select(.endpoints[0]=="background")) | .path | join(" → ")) → click_event" ),
+    (.artifacts[] | select(.stageId=="design") | .content | "  ▸ design: \(.approach); schema changes: \(.schemaChanges | length)", (.decisions[] | select(.title=="Reproduce first") | "  ▸ decision: \(.choice)")),
+    (.artifacts[] | select(.stageId=="test-plan") | .content.testCases[0] | "  ▸ first test: [\(.type)] \(.title)")' | awk '!seen[$0]++'
+  step "first checkpoint is '$(jq -r .stageId <<<"$a")': no migration, so change control had nothing to escalate"
+  approve "$id" "$a"; show "approved by bob"
+  step "finished: $(await_end "$id"), release bump: $(run "$id" | jq -r '.artifacts[] | select(.stageId=="release") | .content | "\(.bump) \(.currentVersion) → \(.version)"')"
 }
 
 section_ambiguous() {
@@ -223,8 +241,8 @@ section_approve() {
 
 curl -sf "$BASE/actuator/health" >/dev/null || { echo "No app at $BASE — start it with ./mvnw spring-boot:run" >&2; exit 1; }
 case "$SECTION" in
-  all) section_shortener; section_greenfield; section_brownfield; section_ambiguous; section_governance; section_metrics ;;
-  shortener|greenfield|brownfield|ambiguous|governance|metrics|pause|approve) "section_$SECTION" ;;
+  all) section_shortener; section_greenfield; section_brownfield; section_bugfix; section_ambiguous; section_governance; section_metrics ;;
+  shortener|greenfield|brownfield|bugfix|ambiguous|governance|metrics|pause|approve) "section_$SECTION" ;;
   *) echo "unknown section '$SECTION'" >&2; exit 2 ;;
 esac
 bold "Done. Swagger UI: $BASE/swagger-ui.html"

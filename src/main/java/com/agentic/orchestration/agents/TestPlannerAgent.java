@@ -55,6 +55,14 @@ public class TestPlannerAgent implements Agent {
         Json.objects(requirements, "assumptions").forEach(a -> assumptionByQuality.put(
                 qualityByQuestion.getOrDefault(a.path("resolves").asString(), ""), a.path("id").asString() + ": " + a.path("statement").asString()));
 
+        String changeType = Json.text(requirements, "changeType", "FEATURE");
+        if (changeType.equals("BUG_FIX")) {
+            tests.add(new TestCase("TC-1", "regression",
+                    "reproduces the reported bug: \"" + Json.text(requirements, "title", "") + "\" (must fail before the fix, pass after)",
+                    List.of()));
+        } else if (changeType.equals("REFACTOR")) {
+            tests.add(new TestCase("TC-1", "regression", "existing suites pass unchanged (behaviour preserved)", List.of()));
+        }
         for (JsonNode criterion : Json.objects(requirements, "acceptanceCriteria")) {
             String id = criterion.path("id").asString();
             String text = criterion.path("text").asString();

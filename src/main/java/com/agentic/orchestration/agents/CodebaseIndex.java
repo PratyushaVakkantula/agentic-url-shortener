@@ -25,8 +25,9 @@ import java.util.stream.Stream;
  *
  * <p>Deliberately lightweight (regex over source, no compiler): fast, dependency-free and good
  * enough for impact analysis, where over-approximating is safe and missing a dependency is not.
- * Same-package references are found by token matching, which over-approximates; that is the
- * safe direction.
+ * Same-package references are found by token matching on code with <b>comments removed</b>
+ * (a Javadoc {@code {@link X}} is documentation, not a dependency); what remains over-approximates,
+ * which is the safe direction.
  */
 public final class CodebaseIndex {
 
@@ -39,6 +40,8 @@ public final class CodebaseIndex {
     private static final Pattern TABLE = Pattern.compile("@Table\\(\\s*name\\s*=\\s*\"(\\w+)\"");
     private static final Pattern IDENTIFIER = Pattern.compile("\\b[A-Z]\\w+\\b");
     private static final Pattern MIGRATION = Pattern.compile("V(\\d+)__.+\\.sql");
+    /** Block/Javadoc comments, and line comments (not the "//" inside URLs such as "https://"). */
+    private static final Pattern COMMENTS = Pattern.compile("/\\*.*?\\*/|(?<![:\"/])//[^\\n]*", Pattern.DOTALL);
 
     /** One production type. {@code module} is the segment after the base package; {@code layer} the one after it. */
     public record JavaType(String fqn, String simpleName, String module, String layer, String path, Set<String> annotations,
@@ -131,7 +134,7 @@ public final class CodebaseIndex {
             Set<String> deps = new LinkedHashSet<>();
             IMPORT.matcher(t.source()).results().map(r -> r.group(1)).filter(types::containsKey).forEach(deps::add);
             Set<String> identifiers = new LinkedHashSet<>();
-            IDENTIFIER.matcher(t.source()).results().forEach(r -> identifiers.add(r.group()));
+            IDENTIFIER.matcher(withoutComments(t.source())).results().forEach(r -> identifiers.add(r.group()));
             for (JavaType sibling : byPackage.get(packageOf(t.fqn()))) {
                 if (!sibling.fqn().equals(t.fqn()) && identifiers.contains(sibling.simpleName())) {
                     deps.add(sibling.fqn());
@@ -147,7 +150,7 @@ public final class CodebaseIndex {
         String source = read(file);
         String name = file.getFileName().toString().replace(".java", "");
         Set<String> identifiers = new LinkedHashSet<>();
-        IDENTIFIER.matcher(source).results().forEach(r -> identifiers.add(r.group()));
+        IDENTIFIER.matcher(withoutComments(source)).results().forEach(r -> identifiers.add(r.group()));
         types.values().stream().filter(t -> identifiers.contains(t.simpleName()))
                 .forEach(t -> testsByType.computeIfAbsent(t.fqn(), k -> new LinkedHashSet<>()).add(name));
     }
@@ -207,6 +210,10 @@ public final class CodebaseIndex {
 
     public int testFileCount() {
         return testFiles;
+    }
+
+    static String withoutComments(String source) {
+        return COMMENTS.matcher(source).replaceAll(" ");
     }
 
     private static String packageOf(String fqn) {

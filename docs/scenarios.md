@@ -1,8 +1,8 @@
-# Scenarios: greenfield, brownfield, ambiguous
+# Scenarios: greenfield, brownfield (enhancement and bug fix), ambiguous
 
 Each scenario is runnable two ways:
 
-- **Live:** `./scripts/demo.sh greenfield` (or `brownfield`, `ambiguous`) against a running app.
+- **Live:** `./scripts/demo.sh greenfield` (or `brownfield`, `bugfix`, `ambiguous`) against a running app.
 - **Automated:** `ScenarioIntegrationTest` (real agents, policies, database and approvals).
 
 The outputs quoted below are from an actual demo run, not illustrations.
@@ -80,8 +80,19 @@ T-5 Add QrCodeController (controller)             ← needs [T-1, T-2, T-3, T-4]
 ```
 module ["shortener"], tables ["short_link"], next migration V5, risk MEDIUM
 seeds ["ShortLink","ShortLinkController","ShortLinkService","ShortLinkRepository","RedirectService"]
-scanned 128 types / 356 dependency edges
+scanned 128 types / 347 dependency edges
+data flows (entry → … → table):
+  ShortLinkController → ShortLinkService → ShortLinkRepository → short_link
+  ShortLinkController → AnalyticsService → ClickEventRepository → click_event
+  RedirectController → RedirectService → RedirectCache → ShortLinkRepository → short_link
+  RedirectController → RedirectService → ClickRecorder → ClickBatchWriter → ClickEventRepository → click_event
+  ClickRecorder → ClickBatchWriter → ClickEventRepository → click_event      (background worker)
+  … 7 in total
 ```
+
+The **data flows** show how a request actually reaches the data, including the asynchronous
+click path through the background worker. They are traced from each impacted entry point
+(controller or background worker) through its collaborators to repositories and their tables.
 
 - It chose the **module** first, so "limit" did not pull in the platform's rate limiter. That
   is tested separately: a rate-limiting requirement lands in `platform`.
@@ -113,6 +124,31 @@ implementation checkpoint. After restart:
 - the run completed, with implementation not redone (attempts = 1)
 
 That also uncovered a durability bug, fixed in [ADR-0010](adr/0010-durability-of-committed-events.md).
+
+---
+
+## 2b. Brownfield bug fix: a real defect, handled as a targeted patch
+
+The brief's brownfield scope is "enhancements, refactors, bug fixes". The same workflow handles a
+bug fix differently from an enhancement. The defect is **real** in this codebase: click analytics
+are written in batches, and one invalid row fails the whole transaction.
+
+> **Fix: one invalid click loses the whole analytics batch.** *Clicks are written in batches.
+> When a single click in a batch cannot be stored, every click in that batch is lost. Valid clicks
+> must still be recorded when one click in the batch is invalid. The invalid click must be counted
+> as failed.*
+
+| Stage | Output | Why it differs from an enhancement |
+|---|---|---|
+| requirements | `changeType: BUG_FIX` | Classified from the title ("Fix") or explicit words like bug, defect, regression. A feature that merely mentions "fails" stays a FEATURE. |
+| impact-analysis | seeds `ClickRecorder`, `ClickBatchWriter`; flow `ClickRecorder → ClickBatchWriter → ClickEventRepository → click_event` | Lands precisely on the batch writer |
+| design | `Targeted fix in place in [shortener]; no new components`; **0 schema changes**; decisions *Reproduce first* and *Compatibility: no API or schema change* | Only features add persisted data. "Cannot be **stored**" would otherwise trip the new-column rule. |
+| test-plan | first case: `[regression] reproduces the reported bug … (must fail before the fix, pass after)` | Proves the defect and prevents recurrence |
+| release | `PATCH 1.4.0 → 1.4.1` | No API or schema change, so semantic versioning gives a patch |
+
+Only **one** human checkpoint (release): no migration, so change control had nothing to escalate.
+Tests: `ScenarioIntegrationTest.bugfix_brownfieldWorkflowHandlesADefectAsATargetedPatch`, and the
+rule "bug fixes never add a column" is mutation-checked.
 
 ---
 

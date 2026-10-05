@@ -162,10 +162,10 @@ Stored in `workflow_event` (append-only, primary key `run_id + seq`, JSON payloa
 
 | Stage | Agent | Real logic |
 |---|---|---|
-| requirements | `requirements-analyst` | Acceptance-criteria extraction; vague-quality dictionary → question + testable assumption per ambiguity |
-| impact-analysis | `impact-analyzer` (fallback `impact-checklist`) | **Static analysis of the repository**: types, layers, imports, endpoints, tables, migrations, tests; module focus; blast radius; entity centrality |
+| requirements | `requirements-analyst` | Acceptance-criteria extraction; vague-quality dictionary → question + testable assumption per ambiguity; change type FEATURE / BUG_FIX / REFACTOR |
+| impact-analysis | `impact-analyzer` (fallback `impact-checklist`) | **Static analysis of the repository**: types, layers, imports (comments ignored), endpoints, tables, migrations, tests; module focus; blast radius; entity centrality; **data flows** from entry points to tables |
 | clarification | `clarification-facilitator` | Packet of open questions and assumptions for the human checkpoint |
-| design | `architect` | Brownfield: nullable column via next migration, API deltas. Greenfield: new module. Assumptions → design measures |
+| design | `architect` | Brownfield feature: nullable column via next migration, API deltas. Bug fix: targeted, reproduce first, no schema change. Refactor: behaviour preserved. Greenfield: new module. Assumptions → design measures |
 | implementation | `implementation-planner` | Proposed changeset + task DAG ordered by layer dependencies |
 | test-plan ∥ security-review | `test-planner`, `security-reviewer` | Criterion → test coverage (unprovable criteria fail the gate); design/changeset security checklist |
 | docs, release | `tech-writer`, `release-manager` | Changelog, ADR draft; semver bump, readiness checklist, rollout/rollback plan |

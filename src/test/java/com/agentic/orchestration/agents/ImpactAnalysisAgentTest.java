@@ -73,6 +73,29 @@ class ImpactAnalysisAgentTest {
     }
 
     @Test
+    void tracesDataFlowsFromEntryPointsThroughServicesToTables() {
+        List<String> keywords = new RequirementsAnalystAgent().analyse(new Requirement("Add per-link click limits",
+                "A link must stop redirecting once its maximum number of clicks is reached.")).keywords();
+        Impact impact = new ImpactAnalysisAgent(ROOT, "com.agentic").analyse(index, keywords, null);
+
+        assertThat(impact.dataFlows()).as("write path of link creation")
+                .anySatisfy(f -> {
+                    assertThat(f.endpoints()).contains("POST /api/v1/urls");
+                    assertThat(f.path()).containsExactly("ShortLinkController", "ShortLinkService", "ShortLinkRepository");
+                    assertThat(f.table()).isEqualTo("short_link");
+                });
+        assertThat(impact.dataFlows()).as("asynchronous click pipeline")
+                .anySatisfy(f -> {
+                    assertThat(f.endpoints()).containsExactly("background");
+                    assertThat(f.path()).containsExactly("ClickRecorder", "ClickBatchWriter", "ClickEventRepository");
+                    assertThat(f.table()).isEqualTo("click_event");
+                });
+        assertThat(impact.dataFlows()).as("redirect reaches clicks through the recorder")
+                .anyMatch(f -> f.entry().equals("RedirectController") && f.path().contains("ClickRecorder")
+                        && f.table().equals("click_event"));
+    }
+
+    @Test
     void rateLimitRequirementLandsInThePlatformModule() {
         Impact impact = analyse("rate", "limit", "token", "bucket", "throttle");
 

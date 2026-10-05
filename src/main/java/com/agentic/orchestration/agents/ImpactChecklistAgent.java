@@ -27,7 +27,7 @@ public class ImpactChecklistAgent implements Agent {
     @Override
     public AgentResult execute(StageContext context) {
         Impact impact = new Impact(List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
-                null, "HIGH", MANUAL_REVIEW, Map.of());
+                List.of(), null, "HIGH", MANUAL_REVIEW, Map.of());
         return AgentResult.of(impact).withDecision("fell back to manual impact review", "static analysis failed; never guess impact");
     }
 }

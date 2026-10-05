@@ -9,7 +9,18 @@ security review → docs → release, as a **governed, event-sourced dependency 
 Agents propose; humans approve. Every decision is audited, survives crashes, and is re-planned
 when its inputs change.
 
-> Java 21 · Spring Boot 4 · H2 (PostgreSQL-ready) · Flyway · 247 tests, 94.6% line coverage · 10 ADRs
+> Java 21 · Spring Boot 4 · H2 (PostgreSQL-ready) · Flyway · 253 tests, 94.5% line coverage · 10 ADRs
+
+## Start here: a 15-minute review
+
+| Time | Do this | What it shows |
+|---|---|---|
+| 3 min | `./mvnw spring-boot:run`, then in a second terminal `./scripts/demo.sh` | Every scenario end to end through the HTTP API: greenfield, brownfield, a bug fix, an ambiguous requirement clarified by a human and re-planned, governance refusals, metrics |
+| 4 min | Read [docs/scenarios.md](docs/scenarios.md) | What the agents decided and why, with the real output |
+| 5 min | Open three files: [RunCoordinator.java](src/main/java/com/agentic/orchestration/engine/RunCoordinator.java) (the class comment shows the whole governance flow), [ArchitectureTest.java](src/test/java/com/agentic/ArchitectureTest.java) (`agentsCannotReachEngineStateOrEvents`), [ImpactAnalysisAgent.java](src/main/java/com/agentic/orchestration/agents/ImpactAnalysisAgent.java) (static analysis of this repo) | The engine design, the enforced autonomy boundary, real codebase reasoning |
+| 3 min | Read [engineering-summary.md §3](docs/engineering-summary.md#3-validation-strategy) | How the work was verified, and the defects that verification found |
+
+Optional: the [crash-recovery demo](#crash-recovery-demo-about-1-minute) (`kill -9` while a run waits for approval) takes one more minute.
 
 ## Highlights
 
@@ -31,7 +42,9 @@ when its inputs change.
   and the same approval can be decided on the new process. Verified live, and by a test that
   `SIGKILL`s a JVM.
 - **Brownfield reasoning.** The impact-analysis agent **statically analyses this repository**:
-  types, dependencies, endpoints, tables, migrations, tests.
+  types, dependencies, endpoints, tables, migrations, tests, and the **data flows** from each
+  entry point to the tables it reaches. Enhancements, bug fixes and refactors are told apart and
+  handled differently (a bug fix is reproduced first and ships as a patch).
 - **Shortener.**
   - SSRF-aware URL validation, including `0177.0.0.1`-style IP spellings.
   - Cached redirect path with asynchronous, batched click analytics.
@@ -55,7 +68,7 @@ On **Windows** use `mvnw.cmd` instead of `./mvnw`, and run the demo script from 
 ```bash
 ./mvnw verify
 ```
-Compiles, runs all 247 tests and the architecture rules, and writes a coverage report to
+Compiles, runs all 253 tests and the architecture rules, and writes a coverage report to
 `target/site/jacoco/index.html`. The first run downloads dependencies, which takes a few minutes; after that a full build takes
 under a minute (about 25 s measured).
 
@@ -77,12 +90,13 @@ In a **second terminal**, with the app running:
 ```bash
 ./scripts/demo.sh
 ```
-Runs everything through the public HTTP API: the shortener, the three scenarios (greenfield,
-brownfield, ambiguous with a human revision), the governance refusals, and the metrics. It takes
+Runs everything through the public HTTP API: the shortener, the scenarios (greenfield,
+brownfield enhancement, brownfield bug fix, ambiguous with a human revision), the governance
+refusals, and the metrics. It takes
 about 5 seconds, and it is safe to run repeatedly.
 
 Run a single section by passing its name, for example `./scripts/demo.sh brownfield`. Sections:
-`shortener`, `greenfield`, `brownfield`, `ambiguous`, `governance`, `metrics`.
+`shortener`, `greenfield`, `brownfield`, `bugfix`, `ambiguous`, `governance`, `metrics`.
 
 ### Demo users
 

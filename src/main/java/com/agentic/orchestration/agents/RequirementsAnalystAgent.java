@@ -59,6 +59,10 @@ public class RequirementsAnalystAgent implements Agent {
 
     private static final Pattern CRITERION = Pattern.compile("\\b(must|should|shall|needs? to|has to|will|can)\\b", Pattern.CASE_INSENSITIVE);
     static final double AMBIGUITY_THRESHOLD = 0.7;
+    /** A bug fix says so in the title, or names a bug/defect/regression explicitly in the text. */
+    private static final Pattern BUG_TITLE = Pattern.compile("\\b(fix(es|ed)?|bug|defect|regression|broken)\\b", Pattern.CASE_INSENSITIVE);
+    private static final Pattern BUG_TEXT = Pattern.compile("\\b(bug|defect|regression)\\b", Pattern.CASE_INSENSITIVE);
+    private static final Pattern REFACTOR = Pattern.compile("\\b(refactor(ing)?|restructure|clean ?up|simplify|extract|rename)\\b", Pattern.CASE_INSENSITIVE);
     private static final Pattern MEASURABLE = Pattern.compile("\\d|\\b(all|every|none|never|always|only|exactly)\\b", Pattern.CASE_INSENSITIVE);
 
     private static Vagueness vague(String regex, String quality, String question, String assumption) {
@@ -74,8 +78,11 @@ public class RequirementsAnalystAgent implements Agent {
     public record Assumption(String id, String statement, String resolves) {
     }
 
-    /** @param classification WELL_DEFINED or AMBIGUOUS (clarity below threshold) */
-    public record Analysis(String title, String statement, String classification, double clarityScore,
+    /**
+     * @param classification WELL_DEFINED or AMBIGUOUS (clarity below threshold)
+     * @param changeType     FEATURE, BUG_FIX or REFACTOR: shapes design, tests and the version bump
+     */
+    public record Analysis(String title, String statement, String classification, String changeType, double clarityScore,
                            boolean needsClarification, List<Criterion> acceptanceCriteria,
                            List<Ambiguity> ambiguities, List<Assumption> assumptions, List<String> keywords) {
     }
@@ -89,7 +96,7 @@ public class RequirementsAnalystAgent implements Agent {
     public AgentResult execute(StageContext context) {
         Analysis analysis = analyse(context.requirement());
         AgentResult result = AgentResult.of(analysis).withDecision(
-                "classified requirement as " + analysis.classification(),
+                "classified requirement as " + analysis.classification() + " " + analysis.changeType(),
                 "clarity " + analysis.clarityScore() + ", " + analysis.ambiguities().size() + " ambiguity(ies), "
                         + analysis.acceptanceCriteria().size() + " acceptance criterion(a)");
         for (Assumption a : analysis.assumptions()) {
@@ -135,7 +142,10 @@ public class RequirementsAnalystAgent implements Agent {
 
         String classification = needsClarification && clarity < AMBIGUITY_THRESHOLD ? "AMBIGUOUS" : "WELL_DEFINED";
 
-        return new Analysis(requirement.title(), requirement.description(), classification, clarity, needsClarification,
+        String changeType = BUG_TITLE.matcher(requirement.title()).find() || BUG_TEXT.matcher(requirement.description()).find()
+                ? "BUG_FIX" : REFACTOR.matcher(requirement.title()).find() ? "REFACTOR" : "FEATURE";
+
+        return new Analysis(requirement.title(), requirement.description(), classification, changeType, clarity, needsClarification,
                 criteria, ambiguities, assumptions, Text.keywords(fullText));
     }
 

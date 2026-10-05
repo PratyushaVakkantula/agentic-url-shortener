@@ -33,7 +33,7 @@ Each step was its own commit with tests, so the history reads as a reasoned prog
 | Requirement → test matrix | [traceability.md](traceability.md) |
 | API contract | `/v3/api-docs`, Swagger UI at `/swagger-ui.html` |
 | Schema | `src/main/resources/db/migration/V1–V4` |
-| Tests | 247 tests; 94.6% line, 80.4% branch coverage (JaCoCo, `target/site/jacoco`) |
+| Tests | 253 tests; 94.5% line, 80.8% branch coverage (JaCoCo, `target/site/jacoco`) |
 | CI | `.github/workflows/ci.yml` (build, all tests, ArchUnit, coverage report) |
 
 ## 3. Validation strategy
@@ -45,9 +45,9 @@ The approach treats a passing test as a claim that needs evidence. Several layer
 | Unit | Pure rules, exhaustive cases | `UrlSafetyValidatorTest` (55 cases incl. `0177.0.0.1`), `PoliciesTest`, `TokenBucketTest` |
 | Concurrency | Tests that can **only** pass if the property holds | A barrier forcing two branches to run simultaneously; 8 threads racing for one alias → exactly one winner |
 | Integration | Real Spring context, real database, HTTP via MockMvc | `ShortenerApiIntegrationTest`, `WorkflowApiIntegrationTest`, `RecoveryIntegrationTest` |
-| Scenario | Whole workflows with real agents, policies, approvals | `ScenarioIntegrationTest` (all three scenarios) |
+| Scenario | Whole workflows with real agents, policies, approvals | `ScenarioIntegrationTest` (greenfield, brownfield enhancement, brownfield bug fix, ambiguous) |
 | Architecture | Design rules executable in the build | `ArchitectureTest` (11 rules, incl. the agent autonomy boundary) |
-| **Mutation checks** | Remove a rule → confirm its test fails | 13 rules checked (marked 🧬 in the [matrix](traceability.md)); 2 initially *survived* and led to better tests |
+| **Mutation checks** | Remove a rule → confirm its test fails | 14 rules checked (marked 🧬 in the [matrix](traceability.md)); 2 initially *survived* and led to better tests |
 | **Process-level** | Kill a real JVM, check committed data | `DurabilityTest` (`SIGKILL` a child process) |
 | Determinism | Injected `Clock` everywhere (ArchUnit-enforced); tests run in `America/New_York` | Catches local-time assumptions that UTC CI runners hide |
 | Stability | Repeat timing-sensitive suites | Orchestration suites run 6–10× in a row with no flakes |
@@ -70,6 +70,8 @@ The approach treats a passing test as a claim that needs evidence. Several layer
 | Review | Duplicate in `Set.of` stopwords: crash on first use | Removed; checked for duplicates |
 | **Live `kill -9`** | **H2 lost committed events on a hard kill (0/50 rows)** | `WRITE_DELAY=0` + `DurabilityTest` ([ADR-0010](adr/0010-durability-of-committed-events.md)) |
 | Live demo | Greenfield module named `code` ("QR" dropped as short) | Keep acronyms |
+| Live demo | Data flows went through classes that only *mention* each other in Javadoc (`{@link ShortLinkService}`), creating 9 false dependency edges | Strip comments before matching (`CodebaseIndexTest`) |
+| Scope review | Brownfield only showed an enhancement; the brief also names bug fixes and refactors, and "data flows" | Change type (FEATURE / BUG_FIX / REFACTOR) shapes design, tests and version; impact analysis traces data flows; bug-fix scenario added |
 | Live demo | Demo script broke on macOS bash 3.2 | Portable empty-array idiom |
 
 ## 4. Risks, trade-offs and mitigations

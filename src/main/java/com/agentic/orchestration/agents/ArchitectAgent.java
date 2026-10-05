@@ -88,9 +88,14 @@ public class ArchitectAgent implements Agent {
         List<String> risks = new ArrayList<>();
         String approach;
 
+        String changeType = Json.text(requirements, "changeType", "FEATURE");
         boolean brownfield = impact != null && !Json.strings(impact, "impactedFiles").isEmpty();
         if (brownfield) {
-            approach = "Extend existing module(s) " + Json.strings(impact, "primaryModules") + " in place";
+            approach = switch (changeType) {
+                case "BUG_FIX" -> "Targeted fix in place in " + Json.strings(impact, "primaryModules") + "; no new components";
+                case "REFACTOR" -> "Behaviour-preserving restructuring of " + Json.strings(impact, "primaryModules");
+                default -> "Extend existing module(s) " + Json.strings(impact, "primaryModules") + " in place";
+            };
             List<String> files = Json.strings(impact, "impactedFiles");
             for (JsonNode seed : Json.objects(impact, "seeds")) {
                 String type = seed.path("type").asString();
@@ -98,7 +103,9 @@ public class ArchitectAgent implements Agent {
                 components.add(new Component(type, kindOf(path), "MODIFY", path, seed.path("reason").asString()));
             }
             List<String> tables = Json.strings(impact, "tables");
-            if (!tables.isEmpty() && NEW_DATA.matcher(allCriteria).find()) {
+            // Only features introduce new persisted data. A bug report saying a click "cannot be stored"
+            // describes a defect, not a request for a new column.
+            if (changeType.equals("FEATURE") && !tables.isEmpty() && NEW_DATA.matcher(allCriteria).find()) {
                 String table = tables.getFirst();
                 Set<String> tableTokens = Text.identifierTokens(table);
                 String column = keywords.stream().map(Text::stem).filter(k -> !tableTokens.contains(k))
@@ -123,6 +130,21 @@ public class ArchitectAgent implements Agent {
                 risks.add("impact analysis rates this change HIGH risk: " + Json.text(impact, "riskRationale", ""));
             }
             risks.add("existing tests " + Json.strings(impact, "existingTests") + " must keep passing (regression)");
+            if (changeType.equals("BUG_FIX")) {
+                decisions.add(new DesignDecision("Reproduce first",
+                        "write a failing regression test from the bug report before changing code",
+                        "proves the defect exists, proves the fix works, and keeps it from coming back"));
+                if (apiChanges.isEmpty()) {
+                    decisions.add(new DesignDecision("Compatibility", "no API or schema change",
+                            "a fix should change behaviour only where it was wrong; clients need no update"));
+                }
+            } else if (changeType.equals("REFACTOR")) {
+                decisions.add(new DesignDecision("Behaviour preserved", "no API, schema or behaviour change",
+                        "existing tests are the safety net and must pass unchanged"));
+                if (!apiChanges.isEmpty()) {
+                    risks.add("refactoring proposes API changes " + apiChanges + ": that is no longer a pure refactor");
+                }
+            }
         } else {
             // Name after the first two keywords, e.g. "QR codes for short links" → module qrcode, entity QrCode.
             String phrase = keywords.isEmpty() ? "feature" : String.join("_", keywords.stream().limit(2).map(Text::stem).toList());

@@ -5,14 +5,17 @@ import com.agentic.orchestration.agent.AgentResult;
 import com.agentic.orchestration.agent.StageContext;
 import com.agentic.orchestration.agents.CodebaseIndex.JavaType;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 import tools.jackson.databind.JsonNode;
@@ -27,6 +30,8 @@ import tools.jackson.databind.JsonNode;
  *       Restricting to one module avoids false positives such as "limit" matching rate limiting.</li>
  *   <li>Expand seeds to their blast radius over the reverse-dependency graph, plus the
  *       persistent entities the seeds operate on.</li>
+ *   <li>Trace <b>data flows</b>: from each impacted entry point (REST controller or background
+ *       worker) through services to the repositories and tables it reaches.</li>
  *   <li>Report impacted modules, REST endpoints, tables, existing tests and the next migration.</li>
  * </ol>
  */
@@ -46,9 +51,21 @@ public class ImpactAnalysisAgent implements Agent {
     public record Seed(String type, int score, String reason) {
     }
 
+    /**
+     * One path from an entry point to persistent data, e.g.
+     * {@code ShortLinkController → ShortLinkService → ShortLinkRepository → short_link}.
+     *
+     * @param entry     the entry type (controller or background worker)
+     * @param endpoints its HTTP routes, or {@code background} for workers
+     * @param path      types from entry to repository, by simple name
+     */
+    public record DataFlow(String entry, List<String> endpoints, List<String> path, String table) {
+    }
+
     /** @param tables impacted tables, most central entity first */
     public record Impact(List<Seed> seeds, List<String> primaryModules, List<String> impactedClasses,
-                         List<String> impactedFiles, List<String> modules, List<String> apis, List<String> tables,
+                         List<String> impactedFiles, List<String> modules, List<String> apis, List<DataFlow> dataFlows,
+                         List<String> tables,
                          List<String> existingTests, String nextMigration, String riskLevel, String riskRationale,
                          Map<String, Integer> stats) {
     }
@@ -153,6 +170,8 @@ public class ImpactAnalysisAgent implements Agent {
                 .sorted(Map.Entry.<String, Integer>comparingByValue().reversed().thenComparing(Map.Entry.comparingByKey()))
                 .map(Map.Entry::getKey).toList();
 
+        List<DataFlow> flows = dataFlows(index, impacted);
+
         boolean touchesSecurity = impactedTypes.stream().anyMatch(t -> t.layer().equals("security"));
         String risk;
         String rationale;
@@ -176,8 +195,71 @@ public class ImpactAnalysisAgent implements Agent {
         return new Impact(seeds, primaryModules,
                 impactedTypes.stream().map(JavaType::simpleName).toList(),
                 impactedTypes.stream().map(JavaType::path).toList(),
-                new ArrayList<>(modules), new ArrayList<>(apis), tables, new ArrayList<>(tests),
+                new ArrayList<>(modules), new ArrayList<>(apis), flows, tables, new ArrayList<>(tests),
                 "V" + index.nextMigrationVersion(), risk, rationale, stats);
+    }
+
+    /**
+     * For every impacted entry point, follows each of its <b>direct</b> collaborators separately
+     * (breadth-first, same module only) to the repositories they reach, then to the table of the
+     * entity each repository manages. Tracing per first hop keeps distinct routes visible: a
+     * controller that writes through one service and reads through another yields both flows.
+     */
+    static List<DataFlow> dataFlows(CodebaseIndex index, Set<String> impacted) {
+        Set<DataFlow> flows = new LinkedHashSet<>();
+        for (String entryFqn : impacted) {
+            JavaType entry = index.type(entryFqn);
+            boolean controller = entry.annotations().contains("RestController");
+            boolean worker = entry.source().contains("SmartLifecycle") || entry.annotations().contains("Scheduled");
+            if (!controller && !worker) {
+                continue;
+            }
+            List<String> endpoints = controller ? entry.endpoints() : List.of("background");
+            for (String firstHop : index.dependenciesOf(entryFqn)) {
+                if (!index.type(firstHop).module().equals(entry.module())) {
+                    continue;
+                }
+                Map<String, String> parent = new LinkedHashMap<>();
+                parent.put(entryFqn, null);
+                parent.put(firstHop, entryFqn);
+                ArrayDeque<String> queue = new ArrayDeque<>(List.of(firstHop));
+                while (!queue.isEmpty()) {
+                    String current = queue.poll();
+                    if (isRepository(index.type(current))) {
+                        tableOf(index, current).ifPresent(table ->
+                                flows.add(new DataFlow(entry.simpleName(), endpoints, pathTo(index, parent, current), table)));
+                        continue;
+                    }
+                    for (String dep : index.dependenciesOf(current)) {
+                        if (!parent.containsKey(dep) && index.type(dep).module().equals(entry.module())) {
+                            parent.put(dep, current);
+                            queue.add(dep);
+                        }
+                    }
+                }
+            }
+        }
+        List<DataFlow> sorted = new ArrayList<>(flows);
+        sorted.sort(Comparator.comparing(DataFlow::entry).thenComparing(DataFlow::table)
+                .thenComparing(f -> String.join(">", f.path())));
+        return sorted;
+    }
+
+    private static boolean isRepository(JavaType type) {
+        return type.layer().equals("repository") && type.simpleName().endsWith("Repository");
+    }
+
+    private static Optional<String> tableOf(CodebaseIndex index, String repositoryFqn) {
+        return index.dependenciesOf(repositoryFqn).stream().map(index::type)
+                .filter(t -> t.table() != null).map(JavaType::table).findFirst();
+    }
+
+    private static List<String> pathTo(CodebaseIndex index, Map<String, String> parent, String target) {
+        LinkedList<String> path = new LinkedList<>();
+        for (String at = target; at != null; at = parent.get(at)) {
+            path.addFirst(index.type(at).simpleName());
+        }
+        return path;
     }
 
     private static int countOccurrences(String haystack, String needle) {

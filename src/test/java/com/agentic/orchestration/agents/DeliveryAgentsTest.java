@@ -54,6 +54,27 @@ class DeliveryAgentsTest {
     }
 
     @Test
+    void bugFixIsATargetedFixThatReproducesFirstAndNeverAddsAColumn() {
+        // "cannot be stored" would trip the new-persisted-data rule for a feature.
+        JsonNode req = requirements("Fix: one invalid click loses the whole analytics batch",
+                "When a single click cannot be stored, every click in the batch is lost. Valid clicks must still be recorded.");
+        JsonNode impact = json(Map.of("primaryModules", List.of("shortener"), "tables", List.of("click_event"),
+                "apis", List.of(), "nextMigration", "V5",
+                "impactedFiles", List.of("src/main/java/com/agentic/shortener/service/ClickBatchWriter.java"),
+                "seeds", List.of(Map.of("type", "ClickBatchWriter", "reason", "name matches")),
+                "existingTests", List.of("ClickRecorderTest"), "riskLevel", "LOW"));
+
+        var design = new ArchitectAgent().design(req, impact);
+        var tests = new TestPlannerAgent().plan(req, json(design), impact);
+
+        assertThat(design.approach()).startsWith("Targeted fix in place");
+        assertThat(design.schemaChanges()).isEmpty();
+        assertThat(design.decisions()).extracting(ArchitectAgent.DesignDecision::title).contains("Reproduce first", "Compatibility");
+        assertThat(tests.testCases().getFirst().type()).isEqualTo("regression");
+        assertThat(tests.testCases().getFirst().title()).contains("must fail before the fix");
+    }
+
+    @Test
     void implementationTasksFollowLayerDependencies() {
         JsonNode design = json(Map.of("components", List.of(
                 Map.of("name", "ShortLinkController", "kind", "controller", "change", "MODIFY", "path", "a/Ctl.java", "reason", ""),

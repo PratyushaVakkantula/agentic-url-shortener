@@ -138,6 +138,34 @@ class ScenarioIntegrationTest {
     }
 
     /**
+     * Brownfield also covers bug fixes. The defect is real (a single bad click loses the whole batch),
+     * and the run treats it as a fix: no schema change, reproduce-first, a regression test, a PATCH
+     * release, and only the release checkpoint because no migration triggers change control.
+     */
+    @Test
+    void bugfix_brownfieldWorkflowHandlesADefectAsATargetedPatch() throws Exception {
+        String runId = engine.start(SdlcWorkflows.BROWNFIELD, new Requirement("Fix: one invalid click loses the whole analytics batch",
+                "Clicks are written in batches. When a single click in a batch cannot be stored, every click in that batch is lost. "
+                        + "Valid clicks must still be recorded when one click in the batch is invalid. The invalid click must be counted as failed."),
+                "alice");
+
+        List<Checkpoint> checkpoints = approveEverything(runId);
+        RunView view = engine.get(runId);
+
+        assertThat(view.status()).isEqualTo(RunStatus.SUCCEEDED);
+        assertThat(artifact(view, "requirements").get("changeType").asString()).isEqualTo("BUG_FIX");
+        JsonNode impact = artifact(view, "impact-analysis");
+        assertThat(impact.get("seeds").toString()).contains("ClickBatchWriter");
+        assertThat(impact.get("dataFlows").toString()).contains("ClickRecorder").contains("click_event");
+        JsonNode design = artifact(view, "design");
+        assertThat(design.get("schemaChanges")).isEmpty();
+        assertThat(design.get("decisions").toString()).contains("Reproduce first");
+        assertThat(artifact(view, "test-plan").get("testCases").get(0).get("type").asString()).isEqualTo("regression");
+        assertThat(artifact(view, "release").get("bump").asString()).isEqualTo("PATCH");
+        assertThat(checkpoints).extracting(Checkpoint::stageId).as("no migration, so no change-control checkpoint").containsExactly("release");
+    }
+
+    /**
      * The vague requirement stops at a clarification checkpoint. Instead of approving the agent's
      * assumptions, the product owner corrects the requirements artifact; re-planning re-runs the
      * clarification stage (its first approval is withdrawn) and everything downstream works from

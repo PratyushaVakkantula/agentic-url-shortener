@@ -71,7 +71,7 @@ Each clause of brief §4.4 is mapped to a testable requirement.
 | OR-14 | "human approval … governance" | Approvals are bound to the content hash of the artifact being approved. If the artifact changes, the approval is void. Separation of duties: the user who started a run cannot approve its checkpoints. Pending approvals expire after a configurable timeout, and expiry rejects them. |
 | OR-15 | "audit-grade … stateful execution" | Runs are **event-sourced**. An append-only event log in the database is the source of truth, and run state is rebuilt by replaying it. After a restart, runs that were waiting for approval are restored and can resume. |
 | OR-16 | "bounded … safe-stop" | Every stage has an execution timeout. A timeout counts as a failed attempt (it is retried). Safe-stop cancels in-flight stages cooperatively. |
-| OR-17 | "codebase reasoning (brownfield)" | The impact-analysis agent does **real** static analysis: it parses this repository's Java sources, builds a package/class dependency graph, and works out which modules, APIs and tables a change touches. |
+| OR-17 | "codebase reasoning (brownfield)" | The impact-analysis agent does **real** static analysis: it parses this repository's Java sources, builds a package/class dependency graph, and works out which modules, APIs, tables and **data flows** a change touches. Brownfield covers enhancements, refactors and bug fixes, each handled differently. |
 
 ---
 

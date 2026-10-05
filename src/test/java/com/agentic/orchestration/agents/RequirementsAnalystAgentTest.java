@@ -40,6 +40,20 @@ class RequirementsAnalystAgentTest {
     }
 
     @Test
+    void classifiesChangeTypeFromTitleAndExplicitBugWordsOnly() {
+        assertThat(analyst.analyse(new Requirement("Add per-link click limits", "Links must return 410 once the limit is reached.")).changeType())
+                .isEqualTo("FEATURE");
+        assertThat(analyst.analyse(new Requirement("Fix: one invalid click loses the whole analytics batch", "Valid clicks must still be recorded.")).changeType())
+                .isEqualTo("BUG_FIX");
+        assertThat(analyst.analyse(new Requirement("Analytics totals", "This regression appeared after the last release.")).changeType())
+                .isEqualTo("BUG_FIX");
+        assertThat(analyst.analyse(new Requirement("Retry webhooks", "If a delivery fails it must be retried three times.")).changeType())
+                .as("a feature that mentions failure is still a feature").isEqualTo("FEATURE");
+        assertThat(analyst.analyse(new Requirement("Refactor the click pipeline", "Split the writer.")).changeType())
+                .isEqualTo("REFACTOR");
+    }
+
+    @Test
     void acronymsSurviveKeywordExtractionDespiteBeingShort() {
         assertThat(analyst.analyse(new Requirement("QR codes for short links", "The API must return a PNG.")).keywords())
                 .startsWith("qr", "code").contains("api", "png");
